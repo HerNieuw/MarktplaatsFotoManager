@@ -41,6 +41,37 @@ def run_safe_command(cmd, timeout=300):
         return False, str(e)
 
 
+def crop_and_scale_background(bg_image_path, target_size):
+    """Schaal de achtergrondafbeelding op de kortste zijde en crop center."""
+    try:
+        bg_img = Image.open(bg_image_path)
+        target_width, target_height = target_size
+        
+        bg_width, bg_height = bg_img.size
+        target_ratio = target_width / target_height
+        bg_ratio = bg_width / bg_height
+        
+        if bg_ratio > target_ratio:
+            new_height = target_height
+            new_width = int(target_height * bg_ratio)
+        else:
+            new_width = target_width
+            new_height = int(target_width / bg_ratio)
+        
+        bg_img = bg_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        
+        left = (new_width - target_width) // 2
+        top = (new_height - target_height) // 2
+        right = left + target_width
+        bottom = top + target_height
+        
+        bg_img = bg_img.crop((left, top, right, bottom))
+        return bg_img
+    except Exception as e:
+        print(f"Fout bij schalen achtergrond: {e}")
+        return None
+
+
 class ImagePreviewWindow(Gtk.Window):
     def __init__(self, parent, image_files):
         super().__init__(title="Inspecteer Afbeeldingen - Transparante Achtergrond")
@@ -51,18 +82,18 @@ class ImagePreviewWindow(Gtk.Window):
         self.rotation_angle = 0
         self.original_pixbuf = None
         self.zoom_level = 100
+        self.is_loading = False
+        self.current_image_path = None
         
-        # Maak het venster schermvullend
         self.set_default_size(Gdk.Screen.width(), Gdk.Screen.height())
         self.set_position(Gtk.WindowPosition.CENTER)
         self.maximize()
         self.set_border_width(10)
         
-        # Main vertical box
         main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.add(main_vbox)
         
-        # Titel balk
+        # Titel
         title_box = Gtk.Box(spacing=10)
         main_vbox.pack_start(title_box, False, False, 0)
         
@@ -74,95 +105,106 @@ class ImagePreviewWindow(Gtk.Window):
         self.status_label.set_xalign(0)
         title_box.pack_start(self.status_label, True, True, 10)
         
-        # Scrollbare afbeelding container
+        # Scrollbare afbeelding
         scrolled_window = Gtk.ScrolledWindow()
         scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         scrolled_window.set_shadow_type(Gtk.ShadowType.IN)
         main_vbox.pack_start(scrolled_window, True, True, 0)
         
-        # Event box voor scroll events (voor zoom met muiswiel)
         self.event_box = Gtk.EventBox()
         self.event_box.set_events(Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
         self.event_box.connect("scroll-event", self.on_scroll_zoom)
         scrolled_window.add(self.event_box)
         
-        # Image display
         self.image = Gtk.Image()
         self.event_box.add(self.image)
         
-        # Toolbar met alle bedieningselementen
+        # Toolbar
         toolbar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        toolbar_box.set_size_request(-1, 120)
+        toolbar_box.set_size_request(-1, 140)
         main_vbox.pack_start(toolbar_box, False, False, 0)
         
-        # Eerste rij: Rotatie en zoom
+        # Rotatie + Zoom
         control_row1 = Gtk.Box(spacing=10)
         toolbar_box.pack_start(control_row1, False, False, 0)
         
-        # Rotatie knoppen
+        # Rotatie
         rotate_frame = Gtk.Frame(label="Rotatie")
-        rotate_box = Gtk.Box(spacing=5)
+        rotate_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         rotate_frame.add(rotate_box)
         control_row1.pack_start(rotate_frame, False, False, 0)
         
-        self.rotate_left_btn = Gtk.Button(label="↺ Links (90°)")
-        self.rotate_left_btn.connect("clicked", self.rotate_left)
-        rotate_box.pack_start(self.rotate_left_btn, False, False, 0)
+        rotate_btn_box = Gtk.Box(spacing=5)
+        rotate_box.pack_start(rotate_btn_box, False, False, 0)
         
-        self.rotate_right_btn = Gtk.Button(label="↻ Rechts (90°)")
+        self.rotate_left_btn = Gtk.Button(label="↺ -90°")
+        self.rotate_left_btn.connect("clicked", self.rotate_left)
+        rotate_btn_box.pack_start(self.rotate_left_btn, False, False, 0)
+        
+        self.rotate_right_btn = Gtk.Button(label="↻ +90°")
         self.rotate_right_btn.connect("clicked", self.rotate_right)
-        rotate_box.pack_start(self.rotate_right_btn, False, False, 0)
+        rotate_btn_box.pack_start(self.rotate_right_btn, False, False, 0)
         
         self.rotate_reset_btn = Gtk.Button(label="⟲ Reset")
         self.rotate_reset_btn.connect("clicked", self.reset_rotation)
-        rotate_box.pack_start(self.rotate_reset_btn, False, False, 0)
+        rotate_btn_box.pack_start(self.rotate_reset_btn, False, False, 0)
         
         self.rotation_label = Gtk.Label(label="0°")
-        rotate_box.pack_start(self.rotation_label, False, False, 10)
+        rotate_btn_box.pack_start(self.rotation_label, False, False, 10)
         
-        # Zoom controls
+        rot_scale_box = Gtk.Box(spacing=5)
+        rotate_box.pack_start(rot_scale_box, False, False, 0)
+        
+        self.rotation_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 360, 1)
+        self.rotation_scale.set_value(0)
+        self.rotation_scale.set_size_request(200, -1)
+        self.rotation_scale.connect("value-changed", self.on_rotation_scale_changed)
+        rot_scale_box.pack_start(self.rotation_scale, True, True, 0)
+        
+        # Zoom
         zoom_frame = Gtk.Frame(label="Zoom")
-        zoom_box = Gtk.Box(spacing=5)
+        zoom_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         zoom_frame.add(zoom_box)
         control_row1.pack_start(zoom_frame, False, False, 0)
         
+        zoom_btn_box = Gtk.Box(spacing=5)
+        zoom_box.pack_start(zoom_btn_box, False, False, 0)
+        
         self.zoom_out_btn = Gtk.Button(label="🔍−")
         self.zoom_out_btn.connect("clicked", self.zoom_out)
-        zoom_box.pack_start(self.zoom_out_btn, False, False, 0)
+        zoom_btn_box.pack_start(self.zoom_out_btn, False, False, 0)
         
         self.zoom_in_btn = Gtk.Button(label="🔍+")
         self.zoom_in_btn.connect("clicked", self.zoom_in)
-        zoom_box.pack_start(self.zoom_in_btn, False, False, 0)
+        zoom_btn_box.pack_start(self.zoom_in_btn, False, False, 0)
         
         self.zoom_fit_btn = Gtk.Button(label="⟐ Passend")
         self.zoom_fit_btn.connect("clicked", self.zoom_fit)
-        zoom_box.pack_start(self.zoom_fit_btn, False, False, 0)
+        zoom_btn_box.pack_start(self.zoom_fit_btn, False, False, 0)
         
         self.zoom_100_btn = Gtk.Button(label="100%")
         self.zoom_100_btn.connect("clicked", self.zoom_100)
-        zoom_box.pack_start(self.zoom_100_btn, False, False, 0)
+        zoom_btn_box.pack_start(self.zoom_100_btn, False, False, 0)
         
         self.zoom_label = Gtk.Label(label="100%")
-        zoom_box.pack_start(self.zoom_label, False, False, 10)
+        zoom_btn_box.pack_start(self.zoom_label, False, False, 10)
         
-        # Zoom percentage entry
-        zoom_entry_box = Gtk.Box(spacing=5)
-        zoom_box.pack_start(zoom_entry_box, False, False, 0)
+        zoom_scale_box = Gtk.Box(spacing=5)
+        zoom_box.pack_start(zoom_scale_box, False, False, 0)
         
-        self.zoom_entry = Gtk.Entry()
-        self.zoom_entry.set_width_chars(6)
-        self.zoom_entry.set_text("100")
-        self.zoom_entry.connect("activate", self.on_zoom_entry_activate)
-        zoom_entry_box.pack_start(self.zoom_entry, False, False, 0)
+        self.zoom_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 10, 400, 1)
+        self.zoom_scale.set_value(100)
+        self.zoom_scale.set_size_request(200, -1)
+        self.zoom_scale.connect("value-changed", self.on_zoom_scale_changed)
+        zoom_scale_box.pack_start(self.zoom_scale, True, True, 0)
         
         zoom_percent_label = Gtk.Label(label="%")
-        zoom_entry_box.pack_start(zoom_percent_label, False, False, 0)
+        zoom_scale_box.pack_start(zoom_percent_label, False, False, 0)
         
-        # Tweede rij: Navigatie en acties
+        # Navigatie
         control_row2 = Gtk.Box(spacing=10)
         toolbar_box.pack_start(control_row2, False, False, 0)
         
-        # Navigatie
         nav_frame = Gtk.Frame(label="Navigatie")
         nav_box = Gtk.Box(spacing=5)
         nav_frame.add(nav_box)
@@ -179,7 +221,6 @@ class ImagePreviewWindow(Gtk.Window):
         self.progress_label = Gtk.Label(label="1/1")
         nav_box.pack_start(self.progress_label, False, False, 10)
         
-        # Image info
         info_frame = Gtk.Frame(label="Informatie")
         info_box = Gtk.Box(spacing=5)
         info_frame.add(info_box)
@@ -188,7 +229,6 @@ class ImagePreviewWindow(Gtk.Window):
         self.image_info_label = Gtk.Label(label="")
         info_box.pack_start(self.image_info_label, False, False, 0)
         
-        # Actie knoppen
         action_frame = Gtk.Frame(label="Acties")
         action_box = Gtk.Box(spacing=5)
         action_frame.add(action_box)
@@ -202,7 +242,7 @@ class ImagePreviewWindow(Gtk.Window):
         self.refresh_btn.connect("clicked", self.refresh_current)
         action_box.pack_start(self.refresh_btn, False, False, 0)
         
-        # Derde rij: Proces knoppen
+        # Proces knoppen
         control_row3 = Gtk.Box(spacing=10)
         toolbar_box.pack_start(control_row3, False, False, 0)
         
@@ -224,17 +264,21 @@ class ImagePreviewWindow(Gtk.Window):
         self.rotate_left_btn.set_tooltip_text("Roteer 90 graden linksom")
         self.rotate_right_btn.set_tooltip_text("Roteer 90 graden rechtsom")
         self.rotate_reset_btn.set_tooltip_text("Reset rotatie naar 0 graden")
+        self.rotation_scale.set_tooltip_text("Sleep om te roteren (0-360 graden)")
         self.zoom_in_btn.set_tooltip_text("Inzoomen (+10%)")
         self.zoom_out_btn.set_tooltip_text("Uitzoomen (-10%)")
         self.zoom_fit_btn.set_tooltip_text("Pas afbeelding aan venster aan")
         self.zoom_100_btn.set_tooltip_text("Zet zoom naar 100%")
-        self.zoom_entry.set_tooltip_text("Voer zoom percentage in (bijv. 150) en druk Enter")
+        self.zoom_scale.set_tooltip_text("Sleep om te zoomen (10-400%)")
         
-        self.load_image(0)
+        GLib.idle_add(self.load_first_image)
         self.show_all()
     
+    def load_first_image(self):
+        self.load_image(0)
+        return False
+    
     def on_scroll_zoom(self, widget, event):
-        """Zoom met muiswiel"""
         if event.direction == Gdk.ScrollDirection.UP:
             self.zoom_in(None)
             return True
@@ -243,61 +287,77 @@ class ImagePreviewWindow(Gtk.Window):
             return True
         return False
     
+    def on_rotation_scale_changed(self, widget):
+        if not self.original_pixbuf:
+            return
+        self.rotation_angle = int(self.rotation_scale.get_value())
+        self.rotation_label.set_text(f"{self.rotation_angle}°")
+        self.update_display()
+    
+    def on_zoom_scale_changed(self, widget):
+        if not self.original_pixbuf:
+            return
+        self.zoom_level = int(self.zoom_scale.get_value())
+        self.zoom_label.set_text(f"{self.zoom_level}%")
+        self.update_display()
+    
     def zoom_in(self, widget):
-        """Zoom in met 10%"""
+        if not self.original_pixbuf:
+            return
         new_zoom = min(400, self.zoom_level + 10)
-        self.set_zoom(new_zoom)
+        self.zoom_level = new_zoom
+        self.zoom_scale.set_value(new_zoom)
+        self.zoom_label.set_text(f"{new_zoom}%")
+        self.update_display()
     
     def zoom_out(self, widget):
-        """Zoom uit met 10%"""
+        if not self.original_pixbuf:
+            return
         new_zoom = max(10, self.zoom_level - 10)
-        self.set_zoom(new_zoom)
+        self.zoom_level = new_zoom
+        self.zoom_scale.set_value(new_zoom)
+        self.zoom_label.set_text(f"{new_zoom}%")
+        self.update_display()
     
     def zoom_fit(self, widget):
-        """Pas afbeelding aan het venster aan"""
-        if self.original_pixbuf:
-            allocation = self.event_box.get_allocation()
-            width = allocation.width - 20
-            height = allocation.height - 20
-            
-            orig_width = self.original_pixbuf.get_width()
-            orig_height = self.original_pixbuf.get_height()
-            
-            if width > 0 and height > 0:
-                scale_x = width / orig_width
-                scale_y = height / orig_height
-                scale = min(scale_x, scale_y) * 100
-                self.set_zoom(int(scale))
+        if not self.original_pixbuf:
+            return
+        allocation = self.event_box.get_allocation()
+        width = allocation.width - 20
+        height = allocation.height - 20
+        
+        orig_width = self.original_pixbuf.get_width()
+        orig_height = self.original_pixbuf.get_height()
+        
+        if width > 0 and height > 0:
+            scale_x = width / orig_width
+            scale_y = height / orig_height
+            scale = min(scale_x, scale_y) * 100
+            new_zoom = int(max(10, min(400, scale)))
+            self.zoom_level = new_zoom
+            self.zoom_scale.set_value(new_zoom)
+            self.zoom_label.set_text(f"{new_zoom}%")
+            self.update_display()
     
     def zoom_100(self, widget):
-        """Zet zoom naar 100%"""
-        self.set_zoom(100)
-    
-    def on_zoom_entry_activate(self, widget):
-        """Verwerk zoom invoer van entry"""
-        try:
-            value = int(self.zoom_entry.get_text())
-            value = max(10, min(400, value))
-            self.set_zoom(value)
-        except ValueError:
-            self.zoom_entry.set_text(str(self.zoom_level))
-    
-    def set_zoom(self, zoom_percent):
-        """Stel zoom percentage in"""
-        self.zoom_level = max(10, min(400, zoom_percent))
-        self.zoom_label.set_text(f"{self.zoom_level}%")
-        self.zoom_entry.set_text(str(self.zoom_level))
-        self.apply_zoom_and_rotation()
-    
-    def apply_zoom_and_rotation(self):
-        """Pas zoom en rotatie toe op de afbeelding voor weergave (schaalt niet het origineel)"""
         if not self.original_pixbuf:
+            return
+        self.zoom_level = 100
+        self.zoom_scale.set_value(100)
+        self.zoom_label.set_text("100%")
+        self.update_display()
+    
+    def update_display(self):
+        """Update de afbeelding met huidige zoom en rotatie (via PIL voor willekeurige hoeken)"""
+        if not self.original_pixbuf or not self.current_image_path:
             return
         
         try:
+            # Haal de originele afbeelding op
             orig_width = self.original_pixbuf.get_width()
             orig_height = self.original_pixbuf.get_height()
             
+            # Schaal eerst (via GdkPixbuf voor snelheid)
             scale = self.zoom_level / 100.0
             new_width = int(orig_width * scale)
             new_height = int(orig_height * scale)
@@ -309,26 +369,45 @@ class ImagePreviewWindow(Gtk.Window):
             else:
                 scaled_pixbuf = self.original_pixbuf.copy()
             
+            # Als er rotatie nodig is, gebruik PIL voor willekeurige hoeken
             if self.rotation_angle != 0:
-                self.current_pixbuf = scaled_pixbuf.rotate_simple(self.rotation_angle)
+                # Converteer GdkPixbuf naar PIL Image
+                data = scaled_pixbuf.get_pixels()
+                pil_img = Image.frombytes('RGBA', (scaled_pixbuf.get_width(), scaled_pixbuf.get_height()), data)
+                
+                # Roteer met PIL (ondersteunt willekeurige hoeken)
+                rotated_pil = pil_img.rotate(self.rotation_angle, expand=True, resample=Image.Resampling.BICUBIC)
+                
+                # Sla de geroteerde afbeelding tijdelijk op en laad hem weer in GdkPixbuf
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                    rotated_pil.save(tmp.name, 'PNG')
+                    tmp_path = tmp.name
+                
+                self.current_pixbuf = GdkPixbuf.Pixbuf.new_from_file(tmp_path)
+                os.unlink(tmp_path)  # Verwijder tijdelijk bestand
             else:
                 self.current_pixbuf = scaled_pixbuf
             
             self.image.set_from_pixbuf(self.current_pixbuf)
             
         except Exception as e:
-            self.status_label.set_text(f"Fout bij zoom/rotatie: {e}")
+            self.status_label.set_text(f"Fout: {e}")
     
     def load_image(self, index):
-        """Laad een afbeelding en reset de rotatie"""
+        if self.is_loading:
+            return
+            
         if 0 <= index < len(self.image_files):
+            self.is_loading = True
             self.current_index = index
             self.rotation_angle = 0
             self.rotation_label.set_text("0°")
+            self.rotation_scale.set_value(0)
             
-            image_path = self.image_files[index]
-            if not os.path.exists(image_path):
-                self.status_label.set_text(f"Bestand niet gevonden: {image_path}")
+            self.current_image_path = self.image_files[index]
+            if not os.path.exists(self.current_image_path):
+                self.status_label.set_text(f"Bestand niet gevonden: {self.current_image_path}")
+                self.is_loading = False
                 return
             
             try:
@@ -337,91 +416,79 @@ class ImagePreviewWindow(Gtk.Window):
                 if self.current_pixbuf:
                     del self.current_pixbuf
                 
-                self.original_pixbuf = GdkPixbuf.Pixbuf.new_from_file(image_path)
+                self.original_pixbuf = GdkPixbuf.Pixbuf.new_from_file(self.current_image_path)
                 
-                filename = os.path.basename(image_path)
+                filename = os.path.basename(self.current_image_path)
                 size = f"{self.original_pixbuf.get_width()}x{self.original_pixbuf.get_height()}"
                 self.image_info_label.set_text(f"{filename}  |  {size}px")
                 self.status_label.set_text(f"Afbeelding {index + 1} van {len(self.image_files)}")
                 self.progress_label.set_text(f"{index + 1}/{len(self.image_files)}")
                 
-                self.zoom_fit(None)
+                GLib.idle_add(self.zoom_fit, None)
                 gc.collect()
                 
             except Exception as e:
                 self.status_label.set_text(f"Fout bij laden: {e}")
+            finally:
+                self.is_loading = False
     
     def rotate_image(self, degrees):
-        """Roteer de huidige afbeelding"""
         if not self.original_pixbuf:
             return
         
-        self.rotation_angle = (self.rotation_angle + degrees) % 360
-        self.rotation_label.set_text(f"{self.rotation_angle}°")
+        new_angle = (self.rotation_angle + degrees) % 360
+        self.rotation_angle = new_angle
+        self.rotation_label.set_text(f"{new_angle}°")
+        self.rotation_scale.set_value(new_angle)
         
-        # Update de weergave
-        self.apply_zoom_and_rotation()
-        self.status_label.set_text(f"Afbeelding geroteerd naar {self.rotation_angle}°")
-        
-        # Sla direct op met originele resolutie
+        self.update_display()
+        self.status_label.set_text(f"Afbeelding geroteerd naar {new_angle}°")
         self.save_rotation()
     
     def save_rotation(self):
         """Sla de geroteerde afbeelding op met behoud van originele resolutie"""
-        if not self.original_pixbuf or self.rotation_angle == 0:
+        if not self.original_pixbuf or self.rotation_angle == 0 or not self.current_image_path:
             return True
         
         try:
-            image_path = self.image_files[self.current_index]
+            # Gebruik PIL voor rotatie met originele resolutie
+            pil_img = Image.open(self.current_image_path)
             
-            # Gebruik de ORIGINELE pixbuf voor rotatie (niet de geschaalde versie)
-            original_copy = self.original_pixbuf.copy()
-            
-            # Roteer de originele afbeelding met behoud van resolutie
+            # Roteer met PIL (behoud kwaliteit)
             if self.rotation_angle != 0:
-                rotated_pixbuf = original_copy.rotate_simple(self.rotation_angle)
+                rotated_pil = pil_img.rotate(self.rotation_angle, expand=True, resample=Image.Resampling.BICUBIC)
             else:
-                rotated_pixbuf = original_copy
+                rotated_pil = pil_img
             
-            # Sla op met de originele resolutie
-            rotated_pixbuf.savev(image_path, "png", [], [])
+            # Sla op als PNG (behoud transparantie)
+            rotated_pil.save(self.current_image_path, 'PNG')
             
-            # Update de originele pixbuf met de geroteerde versie
-            self.original_pixbuf = rotated_pixbuf
+            # Herlaad de pixbuf
+            self.original_pixbuf = GdkPixbuf.Pixbuf.new_from_file(self.current_image_path)
             
-            # Update de weergave
-            self.apply_zoom_and_rotation()
-            
-            self.status_label.set_text(f"Rotatie opgeslagen: {self.rotation_angle}° (originele resolutie behouden)")
-            if hasattr(self.parent, 'log_message'):
-                self.parent.log_message(f"Afbeelding geroteerd naar {self.rotation_angle}°: {os.path.basename(image_path)}")
+            self.update_display()
+            self.status_label.set_text(f"Rotatie opgeslagen: {self.rotation_angle}°")
             return True
         except Exception as e:
             self.status_label.set_text(f"Fout bij opslaan: {e}")
             return False
     
     def rotate_left(self, widget):
-        """Roteer 90 graden linksom (tegen de klok in)"""
-        self.rotate_image(-90)  # -90 = linksom
+        self.rotate_image(-90)
     
     def rotate_right(self, widget):
-        """Roteer 90 graden rechtsom (met de klok mee)"""
-        self.rotate_image(90)   # +90 = rechtsom
+        self.rotate_image(90)
     
     def reset_rotation(self, widget):
-        """Reset de rotatie naar 0"""
         self.rotation_angle = 0
         self.rotation_label.set_text("0°")
+        self.rotation_scale.set_value(0)
         
-        # Herstel de originele afbeelding (zonder rotatie)
         try:
-            image_path = self.image_files[self.current_index]
-            # Herlaad de originele afbeelding van schijf
-            self.original_pixbuf = GdkPixbuf.Pixbuf.new_from_file(image_path)
-            self.apply_zoom_and_rotation()
-            self.status_label.set_text("Rotatie gereset")
-            if hasattr(self.parent, 'log_message'):
-                self.parent.log_message(f"Rotatie gereset: {os.path.basename(image_path)}")
+            if self.current_image_path and os.path.exists(self.current_image_path):
+                self.original_pixbuf = GdkPixbuf.Pixbuf.new_from_file(self.current_image_path)
+                self.update_display()
+                self.status_label.set_text("Rotatie gereset")
         except Exception as e:
             self.status_label.set_text(f"Fout bij resetten: {e}")
     
@@ -438,7 +505,7 @@ class ImagePreviewWindow(Gtk.Window):
     def open_in_gimp(self, widget):
         try:
             self.save_rotation()
-            subprocess.Popen(["gimp", self.image_files[self.current_index]], 
+            subprocess.Popen(["gimp", self.current_image_path], 
                            stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
             self.status_label.set_text("Afbeelding geopend in GIMP")
         except FileNotFoundError:
@@ -492,7 +559,7 @@ class MarktplaatsApp(Gtk.Window):
             'background_image': '',
             'auto_rotate': True,
             'color_enhance': True,
-            'bg_removal_tool': 'transparent-background'  # Standaard: transparent-background
+            'bg_removal_tool': 'transparent-background'
         }
         
         self.transparent_pngs = []
@@ -601,6 +668,7 @@ class MarktplaatsApp(Gtk.Window):
         self.bg_type_combo.append_text("Wit (standaard)")
         self.bg_type_combo.append_text("Kleur")
         self.bg_type_combo.append_text("Afbeelding")
+        self.bg_type_combo.append_text("Originele achtergrond behouden")
         self.bg_type_combo.set_active(0)
         self.bg_type_combo.connect("changed", self.on_background_type_changed)
         type_box.pack_start(type_label, False, False, 0)
@@ -633,7 +701,7 @@ class MarktplaatsApp(Gtk.Window):
         info_label.set_markup("<small>Tip: HEX code zoals #ff0000 (rood) of selecteer een afbeelding</small>")
         bg_box.pack_start(info_label, False, False, 0)
         
-        # Tool selectie voor achtergrond verwijdering
+        # Tool selectie
         tool_frame = Gtk.Frame(label="Achtergrond Verwijdering Tool")
         tool_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         tool_frame.add(tool_box)
@@ -654,7 +722,6 @@ class MarktplaatsApp(Gtk.Window):
         self.tool_rembg.connect("toggled", self.on_tool_changed, "rembg")
         tool_radio_box.pack_start(self.tool_rembg, False, False, 0)
         
-        # Status van tools
         tool_status_box = Gtk.Box(spacing=10)
         tool_box.pack_start(tool_status_box, False, False, 5)
         
@@ -662,7 +729,6 @@ class MarktplaatsApp(Gtk.Window):
         self.tool_status_label.set_markup("<small>Controleren van geïnstalleerde tools...</small>")
         tool_status_box.pack_start(self.tool_status_label, False, False, 0)
         
-        # Controleer welke tools zijn geïnstalleerd
         self.check_installed_tools()
         
         # Opties
@@ -688,10 +754,8 @@ class MarktplaatsApp(Gtk.Window):
         return page
     
     def check_installed_tools(self):
-        """Controleer welke achtergrond-verwijdering tools zijn geïnstalleerd"""
         tools_status = []
         
-        # Check transparent-background (standaard)
         try:
             import transparent_background
             tools_status.append("✅ Transparent-Background (geïnstalleerd)")
@@ -700,7 +764,6 @@ class MarktplaatsApp(Gtk.Window):
             tools_status.append("❌ Transparent-Background (niet geïnstalleerd)")
             self.tool_transparent.set_sensitive(False)
         
-        # Check rembg (alternatief)
         try:
             import rembg
             tools_status.append("✅ Rembg (geïnstalleerd)")
@@ -712,7 +775,6 @@ class MarktplaatsApp(Gtk.Window):
         status_text = " | ".join(tools_status)
         self.tool_status_label.set_markup(f"<small>{status_text}</small>")
         
-        # Zet standaard tool (transparent-background) als deze beschikbaar is
         if self.config.get('bg_removal_tool') == 'transparent-background' and self.tool_transparent.get_sensitive():
             self.tool_transparent.set_active(True)
         elif self.config.get('bg_removal_tool') == 'rembg' and self.tool_rembg.get_sensitive():
@@ -858,12 +920,11 @@ class MarktplaatsApp(Gtk.Window):
         selected = self.bg_type_combo.get_active()
         if selected == 0: self.config['background_type'] = 'white'
         elif selected == 1: self.config['background_type'] = 'color'
-        else: self.config['background_type'] = 'image'
+        elif selected == 2: self.config['background_type'] = 'image'
+        else: self.config['background_type'] = 'original'
         
         self.config['background_color'] = self.bg_color_entry.get_text()
         self.config['background_image'] = self.bg_image_entry.get_text()
-        
-        # Tool keuze wordt al opgeslagen via on_tool_changed
         
         with open(os.path.expanduser("~/.marktplaats_manager_config.json"), 'w') as f:
             json.dump(self.config, f, indent=2)
@@ -889,7 +950,8 @@ class MarktplaatsApp(Gtk.Window):
                 bg_type = self.config.get('background_type', 'white')
                 if bg_type == 'white': self.bg_type_combo.set_active(0)
                 elif bg_type == 'color': self.bg_type_combo.set_active(1)
-                else: self.bg_type_combo.set_active(2)
+                elif bg_type == 'image': self.bg_type_combo.set_active(2)
+                else: self.bg_type_combo.set_active(3)
                 
                 self.bg_color_entry.set_text(self.config.get('background_color', '#ffffff'))
                 self.bg_image_entry.set_text(self.config.get('background_image', ''))
@@ -916,20 +978,22 @@ class MarktplaatsApp(Gtk.Window):
             self.show_error("Selecteer een uitvoermap")
             return
         
-        # Controleer of de geselecteerde tool beschikbaar is
-        tool = self.config.get('bg_removal_tool', 'transparent-background')
-        if tool == 'transparent-background':
-            try:
-                import transparent_background
-            except ImportError:
-                self.show_error("Transparent-Background is niet geïnstalleerd!\nInstalleer met: pip install transparent-background")
-                return
-        else:  # rembg
-            try:
-                import rembg
-            except ImportError:
-                self.show_error("Rembg is niet geïnstalleerd!\nInstalleer met: pip install rembg")
-                return
+        bg_type = self.config.get('background_type', 'white')
+        
+        if bg_type != 'original':
+            tool = self.config.get('bg_removal_tool', 'transparent-background')
+            if tool == 'transparent-background':
+                try:
+                    import transparent_background
+                except ImportError:
+                    self.show_error("Transparent-Background is niet geïnstalleerd!\nInstalleer met: pip install transparent-background")
+                    return
+            else:
+                try:
+                    import rembg
+                except ImportError:
+                    self.show_error("Rembg is niet geïnstalleerd!\nInstalleer met: pip install rembg")
+                    return
         
         self.start_btn.set_sensitive(False)
         self.stop_btn.set_sensitive(True)
@@ -954,7 +1018,6 @@ class MarktplaatsApp(Gtk.Window):
         return False
     
     def process_remove_background_rembg(self, image_paths, output_dir):
-        """Verwijder achtergrond met rembg"""
         self.log_message("Achtergrond verwijderen met rembg...")
         output_files = []
         
@@ -980,7 +1043,6 @@ class MarktplaatsApp(Gtk.Window):
                 
             except Exception as e:
                 self.log_message(f"Fout met rembg voor {img}: {e}", True)
-                # Fallback: kopieer origineel
                 shutil.copy2(img, output_path)
                 output_files.append(output_path)
             
@@ -990,7 +1052,6 @@ class MarktplaatsApp(Gtk.Window):
         return output_files
     
     def process_remove_background_transparent(self, image_paths, output_dir):
-        """Verwijder achtergrond met transparent-background"""
         self.log_message("Achtergrond verwijderen met transparent-background...")
         
         for batch_start in range(0, len(image_paths), 3):
@@ -1017,7 +1078,6 @@ class MarktplaatsApp(Gtk.Window):
             progress = 0.5 + ((batch_start + len(batch)) / len(image_paths)) * 0.1
             self.update_progress_safe(progress)
         
-        # Verzamel ALLE PNGs in de output directory
         output_files = glob.glob(os.path.join(output_dir, "*.png"))
         self.log_message(f"{len(output_files)} PNG bestanden gevonden in {output_dir}")
         
@@ -1027,23 +1087,18 @@ class MarktplaatsApp(Gtk.Window):
         try:
             self.log_message("=== START VERWERKING ===")
             
-            # Maak tijdelijke mappen schoon
-            input_dir = os.path.expanduser("~/Documenten/MarktplaatsProgramma/input")
-            enhance_dir = os.path.expanduser("~/Documenten/MarktplaatsProgramma/output")
+            bg_type = self.config.get('background_type', 'white')
+            is_original = (bg_type == 'original')
+            
+            # Gebruik de juiste paden voor jouw systeem
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            input_dir = os.path.join(base_dir, "input")
+            enhance_dir = os.path.join(base_dir, "output")
             
             for d in [input_dir, enhance_dir]:
                 if os.path.exists(d):
                     shutil.rmtree(d, ignore_errors=True)
                 os.makedirs(d, exist_ok=True)
-            
-            # Maak transparant map schoon
-            transparent_dir = os.path.join(self.config['output_dir'], "transparant")
-            if os.path.exists(transparent_dir):
-                shutil.rmtree(transparent_dir, ignore_errors=True)
-            os.makedirs(transparent_dir, exist_ok=True)
-            
-            tool = self.config.get('bg_removal_tool', 'transparent-background')
-            self.log_message(f"Gebruikte tool: {tool}")
             
             if self.stop_flag: return
             
@@ -1069,7 +1124,19 @@ class MarktplaatsApp(Gtk.Window):
                 copied_files.append(dest)
                 self.update_progress_safe((i + 1) / len(image_files) * 0.2)
             
-            # Stap 2: Auto-rotatie
+            if is_original:
+                self.log_message("Originele achtergrond behouden - overslaan van achtergrond verwijdering")
+                self.transparent_pngs = copied_files
+                self.log_message(f"{len(self.transparent_pngs)} originele afbeeldingen worden gebruikt")
+                self.update_progress_safe(0.6)
+                
+                if self.transparent_pngs:
+                    GLib.idle_add(self.show_inspection_window)
+                else:
+                    self.log_message("Geen afbeeldingen!", True)
+                    GLib.idle_add(self.reset_ui_after_error)
+                return
+            
             if self.config['auto_rotate']:
                 self.log_message("Stap 2: Auto-rotatie...")
                 for i, img in enumerate(copied_files):
@@ -1077,14 +1144,12 @@ class MarktplaatsApp(Gtk.Window):
                     run_safe_command(["mogrify", "-auto-orient", img], timeout=60)
                     self.update_progress_safe(0.2 + (i / len(copied_files)) * 0.1)
             
-            # Stap 3: Verkleinen
             self.log_message("Stap 3: Verkleinen naar 50%...")
             for i, img in enumerate(copied_files):
                 if self.stop_flag: return
                 run_safe_command(["mogrify", "-colorspace", "RGB", "-resize", "50%", "-colorspace", "sRGB", img], timeout=120)
                 self.update_progress_safe(0.3 + (i / len(copied_files)) * 0.1)
             
-            # Stap 4: Kleurverbetering
             if self.config['color_enhance']:
                 self.log_message("Stap 4: Kleurverbetering...")
                 for i, img in enumerate(copied_files):
@@ -1100,8 +1165,13 @@ class MarktplaatsApp(Gtk.Window):
             else:
                 processed_dir = input_dir
             
-            # Stap 5: Maak transparante PNG (met gekozen tool)
+            tool = self.config.get('bg_removal_tool', 'transparent-background')
             self.log_message(f"Stap 5: Transparante achtergrond maken met {tool}...")
+            
+            transparent_dir = os.path.join(self.config['output_dir'], "transparant")
+            if os.path.exists(transparent_dir):
+                shutil.rmtree(transparent_dir, ignore_errors=True)
+            os.makedirs(transparent_dir, exist_ok=True)
             
             images_to_process = glob.glob(os.path.join(processed_dir, "*.jpg")) + glob.glob(os.path.join(processed_dir, "*.JPG"))
             self.log_message(f"{len(images_to_process)} afbeeldingen te verwerken")
@@ -1114,7 +1184,6 @@ class MarktplaatsApp(Gtk.Window):
             self.log_message(f"{len(self.transparent_pngs)} transparante PNGs gemaakt")
             self.update_progress_safe(0.6)
             
-            # Stap 6: Toon inspectievenster
             if self.transparent_pngs:
                 GLib.idle_add(self.show_inspection_window)
             else:
@@ -1148,15 +1217,20 @@ class MarktplaatsApp(Gtk.Window):
                 background.save(output_path, 'JPEG', quality=95)
                 
             elif bg_type == 'image' and bg_image and os.path.exists(bg_image):
-                bg_img = Image.open(bg_image)
-                bg_img = bg_img.resize(img.size, Image.Resampling.LANCZOS)
-                if bg_img.mode != 'RGB':
-                    bg_img = bg_img.convert('RGB')
-                if img.mode == 'RGBA':
-                    bg_img.paste(img, (0, 0), img.split()[3])
+                bg_img = crop_and_scale_background(bg_image, img.size)
+                if bg_img is not None:
+                    if img.mode == 'RGBA':
+                        bg_img.paste(img, (0, 0), img.split()[3])
+                    else:
+                        bg_img.paste(img, (0, 0))
+                    bg_img.save(output_path, 'JPEG', quality=95)
                 else:
-                    bg_img.paste(img, (0, 0))
-                bg_img.save(output_path, 'JPEG', quality=95)
+                    background = Image.new('RGB', img.size, (255, 255, 255))
+                    if img.mode == 'RGBA':
+                        background.paste(img, (0, 0), img.split()[3])
+                    else:
+                        background.paste(img, (0, 0))
+                    background.save(output_path, 'JPEG', quality=95)
                 
             else:
                 background = Image.new('RGB', img.size, (255, 255, 255))
@@ -1180,6 +1254,7 @@ class MarktplaatsApp(Gtk.Window):
             return
         
         bg_type = self.config.get('background_type', 'white')
+        is_original = (bg_type == 'original')
         bg_color = self.config.get('background_color', '#ffffff') if bg_type == 'color' else None
         bg_image = self.config.get('background_image', '') if bg_type == 'image' else None
         
@@ -1189,7 +1264,7 @@ class MarktplaatsApp(Gtk.Window):
         temp_square_dir = os.path.join(self.config['output_dir'], "temp_square")
         os.makedirs(temp_square_dir, exist_ok=True)
         
-        self.log_message("Stap 1: Vierkant maken van transparante PNGs (2040x2040)...")
+        self.log_message("Stap 1: Vierkant maken van afbeeldingen (2040x2040)...")
         square_pngs = []
         
         for i, png in enumerate(self.transparent_pngs):
@@ -1204,17 +1279,17 @@ class MarktplaatsApp(Gtk.Window):
             try:
                 img = Image.open(square_png)
                 square_size = 2040
-                square_canvas = Image.new('RGBA', (square_size, square_size), (0, 0, 0, 0))
+                square_canvas = Image.new('RGBA' if not is_original else 'RGB', (square_size, square_size), (0, 0, 0, 0))
                 
                 x_offset = (square_size - img.width) // 2
                 y_offset = (square_size - img.height) // 2
                 
-                if img.mode == 'RGBA':
+                if img.mode == 'RGBA' and not is_original:
                     square_canvas.paste(img, (x_offset, y_offset), img)
                 else:
                     square_canvas.paste(img, (x_offset, y_offset))
                 
-                square_canvas.save(square_png, 'PNG')
+                square_canvas.save(square_png, 'PNG' if not is_original else 'JPEG', quality=95)
                 square_pngs.append(square_png)
             except Exception as e:
                 self.log_message(f"Fout bij vierkant maken: {e}", True)
@@ -1223,6 +1298,38 @@ class MarktplaatsApp(Gtk.Window):
             progress = 0.7 + ((i + 1) / len(self.transparent_pngs)) * 0.1
             self.update_progress_safe(progress)
         
+        if is_original:
+            self.log_message("Originele achtergrond behouden - alleen logo/watermerk toevoegen")
+            
+            rand_prefix = ''.join(random.choices(string.ascii_uppercase, k=3))
+            files_with_logo = []
+            
+            temp_with_logo_dir = os.path.join(self.config['output_dir'], "temp_with_logo")
+            os.makedirs(temp_with_logo_dir, exist_ok=True)
+            
+            for i, png in enumerate(square_pngs):
+                if self.stop_flag:
+                    self.log_message("Verwerking gestopt")
+                    GLib.idle_add(self.reset_ui_after_stop)
+                    return
+                
+                jpg_path = os.path.join(temp_with_logo_dir, f"logo_{i:03d}.jpg")
+                shutil.copy2(png, jpg_path)
+                
+                if has_watermark:
+                    run_safe_command(["mogrify", "-path", temp_with_logo_dir, "-draw", f"image over 0,0 0,0 '{self.config['watermark_path']}'", jpg_path], timeout=60)
+                if has_logo:
+                    run_safe_command(["mogrify", "-gravity", "northeast", "-geometry", "+10+10", "-draw", f"image over 0,0 0,0 '{self.config['logo_path']}'", jpg_path], timeout=60)
+                
+                files_with_logo.append(jpg_path)
+                self.update_progress_safe(0.8 + (i / len(square_pngs)) * 0.1)
+            
+            self.update_progress_safe(0.95)
+            
+            GLib.idle_add(self.ask_for_article_number_original, files_with_logo, temp_with_logo_dir, temp_square_dir)
+            return
+        
+        # Normale flow
         self.log_message("Stap 2: Achtergrond toevoegen aan vierkante afbeeldingen...")
         
         white_files = []
@@ -1251,7 +1358,6 @@ class MarktplaatsApp(Gtk.Window):
         white_with_logo = []
         bg_with_logo = []
         
-        # Alleen watermerk/logo toevoegen als er minimaal 1 is geselecteerd
         if has_watermark or has_logo:
             for img in white_files:
                 new_path = img.replace('.jpg', '_with_logo.jpg')
@@ -1278,6 +1384,92 @@ class MarktplaatsApp(Gtk.Window):
         self.update_progress_safe(0.95)
         
         GLib.idle_add(self.ask_for_article_number, white_files, white_with_logo, bg_files, bg_with_logo, temp_square_dir, has_watermark or has_logo)
+    
+    def ask_for_article_number_original(self, files_with_logo, temp_with_logo_dir, temp_square_dir):
+        self.log_message("Vraag artikelnummer (originele achtergrond modus)...")
+        
+        dialog = Gtk.Dialog(title="Artikelnummer", parent=self, flags=0)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        dialog.set_default_size(500, 350)
+        
+        box = dialog.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(10)
+        
+        label = Gtk.Label(label="Voer artikel/locatie nummer in:")
+        label.set_xalign(0)
+        box.pack_start(label, False, False, 0)
+        
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("Bijv: 12345 of KLANT_A")
+        entry.set_size_request(300, -1)
+        box.pack_start(entry, False, False, 0)
+        
+        info_text = "Mappen die worden aangemaakt:\n\n"
+        info_text += "📁 met_logo/           - JPEG met logo/watermerk (originele achtergrond behouden)\n"
+        info_text += "📁 originelen/         - Originele foto's uit bronmap (optioneel)"
+        
+        info_label = Gtk.Label()
+        info_label.set_markup(f"<small>{info_text}</small>")
+        info_label.set_xalign(0)
+        box.pack_start(info_label, False, False, 0)
+        
+        move_originals_check = Gtk.CheckButton(label="Originele foto's verplaatsen naar map 'originelen/'")
+        move_originals_check.set_active(True)
+        box.pack_start(move_originals_check, False, False, 5)
+        
+        dialog.show_all()
+        response = dialog.run()
+        
+        if response == Gtk.ResponseType.OK:
+            article_number = entry.get_text().strip()
+            if article_number:
+                final_dir = os.path.join(os.path.dirname(self.config['output_dir']), article_number)
+                os.makedirs(final_dir, exist_ok=True)
+                
+                dir_with_logo = os.path.join(final_dir, "met_logo")
+                os.makedirs(dir_with_logo, exist_ok=True)
+                
+                rand_prefix = ''.join(random.choices(string.ascii_uppercase, k=3))
+                
+                for i, img in enumerate(files_with_logo):
+                    if os.path.exists(img):
+                        new_name = f"{rand_prefix}_{i+1:03d}.jpg"
+                        dest = os.path.join(dir_with_logo, new_name)
+                        shutil.move(img, dest)
+                
+                if move_originals_check.get_active():
+                    dir_originals = os.path.join(final_dir, "originelen")
+                    os.makedirs(dir_originals, exist_ok=True)
+                    originals_count = 0
+                    for ext in ['*.jpg', '*.JPG', '*.jpeg', '*.JPEG']:
+                        for img in glob.glob(os.path.join(self.config['source_dir'], ext)):
+                            dest = os.path.join(dir_originals, os.path.basename(img))
+                            shutil.move(img, dest)
+                            originals_count += 1
+                    self.log_message(f"Originelen: {originals_count} bestanden")
+                
+                shutil.rmtree(temp_square_dir, ignore_errors=True)
+                shutil.rmtree(temp_with_logo_dir, ignore_errors=True)
+                
+                self.log_message(f"=== VERWERKING VOLTOOID! ===")
+                self.log_message(f"Bestanden opgeslagen in: {final_dir}")
+                
+                success_msg = f"✅ Verwerking voltooid!\n\n"
+                success_msg += f"📁 met_logo/ - {len(files_with_logo)} bestanden\n"
+                success_msg += f"\n📍 Locatie: {final_dir}"
+                
+                success_dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, text="Verwerking voltooid!")
+                success_dialog.format_secondary_text(success_msg)
+                success_dialog.run()
+                success_dialog.destroy()
+                
+                self.update_progress_safe(1.0)
+                self.next_project_btn.set_sensitive(True)
+        
+        dialog.destroy()
+        self.start_btn.set_sensitive(True)
+        self.stop_btn.set_sensitive(False)
     
     def ask_for_article_number(self, white_files, white_with_logo, bg_files, bg_with_logo, temp_square_dir, has_logo_files):
         self.log_message("Vraag artikelnummer...")
@@ -1340,7 +1532,6 @@ class MarktplaatsApp(Gtk.Window):
                 os.makedirs(dir_transparent, exist_ok=True)
                 os.makedirs(dir_without, exist_ok=True)
                 
-                # Alleen met_logo aanmaken als er logo bestanden zijn
                 if has_logo_files and white_with_logo:
                     dir_with = os.path.join(final_dir, "met_logo")
                     os.makedirs(dir_with, exist_ok=True)
@@ -1358,7 +1549,6 @@ class MarktplaatsApp(Gtk.Window):
                         dest = os.path.join(dir_without, new_name)
                         shutil.move(img, dest)
                 
-                # Alleen met_logo bestanden verplaatsen als ze bestaan
                 if has_logo_files and white_with_logo:
                     for i, img in enumerate(white_with_logo):
                         if os.path.exists(img):
@@ -1430,23 +1620,26 @@ class MarktplaatsApp(Gtk.Window):
         self.log_message("=== START NIEUW PROJECT ===")
         self.transparent_pngs = []
         self.stop_flag = False
-        
+
         self.start_btn.set_sensitive(True)
         self.stop_btn.set_sensitive(False)
         self.next_project_btn.set_sensitive(False)
         self.progress_bar.set_fraction(0)
         self.info_label.set_markup("<span size='large'>Klik op 'Start Verwerking' voor een nieuw project</span>")
-        
-        input_dir = os.path.expanduser("~/Documenten/MarktplaatsProgramma/input")
-        enhance_dir = os.path.expanduser("~/Documenten/MarktplaatsProgramma/output")
+    
+        # Gebruik dezelfde paden als in process_images
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        input_dir = os.path.join(base_dir, "input")
+        enhance_dir = os.path.join(base_dir, "output")
+    
         for d in [input_dir, enhance_dir]:
             if os.path.exists(d):
                 shutil.rmtree(d, ignore_errors=True)
                 os.makedirs(d, exist_ok=True)
-        
+    
         transparent_dir = os.path.join(self.config['output_dir'], "transparant")
         shutil.rmtree(transparent_dir, ignore_errors=True)
-        
+    
         self.log_message("Klaar voor volgend project.")
     
     def reset_ui_after_error(self):
