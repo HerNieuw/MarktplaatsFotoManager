@@ -4,6 +4,14 @@ Automatisch Kringloop foto-bewerking &amp; archieverings-tool voor Marktplaats
 
 
 
+
+
+
+https://github.com/user-attachments/assets/2ac2cf42-3e2a-4387-8c01-3776a4dc356a
+
+
+
+
 <img width="1533" height="868" alt="Screenshot From 2026-07-30 22-09-07" src="https://github.com/user-attachments/assets/95347a9f-bad5-484f-9667-abdefeb8af0f" />
 Kies mappen, logo, watermerk, eventueel een achtergrond kleur of thema.
 
