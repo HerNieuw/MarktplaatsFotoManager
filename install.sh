@@ -1,87 +1,66 @@
 #!/bin/bash
+# install_fotomanager.sh
+# Universele installatie voor Marktplaats Foto Manager (werkt op elke pc)
 
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
-APP_NAME="marktplaats_manager.py"
-ICON_NAME="icon.png"
+set -e
 
-echo "📦 Stap 1: Controleren en installeren van systeem-tools (ImageMagick)..."
-if ! command -v mogrify &> /dev/null; then
-    echo "   ImageMagick niet gevonden. Installeren..."
-    if command -v apt &> /dev/null; then
-        sudo apt update && sudo apt install -y imagemagick
-    elif command -v dnf &> /dev/null; then
-        sudo dnf install -y imagemagick
-    elif command -v yum &> /dev/null; then
-        sudo yum install -y imagemagick
-    else
-        echo "⚠️  Kan ImageMagick niet installeren. Installeer het handmatig via je package manager."
-    fi
+# Bepaal het pad waar dit script staat (dus waar de app staat)
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "📦 Systeemafhankelijkheden installeren (GTK & Python)..."
+sudo apt update
+sudo apt install -y python3-gi gir1.2-gtk-3.0 python3-pip
+
+# Zorg dat Pillow (voor fotobewerking) geïnstalleerd is
+pip install --break-system-packages Pillow
+
+# Icoon check
+if [ -f "$APP_DIR/icon.png" ]; then
+    echo "🖼️  Icoon gevonden"
 else
-    echo "   ✅ ImageMagick is aanwezig."
+    echo "⚠️  Geen icon.png gevonden - snelkoppeling krijgt geen custom icoon"
 fi
 
-echo "📦 Stap 2: Controleren en installeren van Python packages (zonder systeem te breken)..."
-# Gebruik --user om nooit systeem-packages te breken!
-pip3 install --user --upgrade pip > /dev/null 2>&1
-pip3 install --user Pillow psutil transparent-background rembg opencv-python opencv-contrib-python tqdm > /dev/null 2>&1
-
-# Zorg dat ~/.local/bin in de PATH zit (anders werkt 'mp-foto' niet)
-if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-    echo "   🔄 PATH bijgewerkt. Herstart je terminal of voer 'source ~/.bashrc' uit."
-fi
-
-# Zorg dat ALLE scripts uitvoerbaar zijn
-chmod +x "$SCRIPT_DIR/$APP_NAME"
-chmod +x "$SCRIPT_DIR/image_enhancer.py"
-
-mkdir -p "$HOME/.local/bin"
-LAUNCHER_SCRIPT="$HOME/.local/bin/marktplaats-launcher.sh"
-
-cat > "$LAUNCHER_SCRIPT" << EOF
+# =========================================================
+# Startscript aanmaken (DIT is de truc die het universeel maakt!)
+# =========================================================
+cat > "$APP_DIR/start-foto" << EOF
 #!/bin/bash
-cd "$SCRIPT_DIR"
-python3 "$SCRIPT_DIR/$APP_NAME"
+# Dit bestand wordt dynamisch gegenereerd door install_fotomanager.sh
+cd "\$(dirname "\$0")"
+export GDK_BACKEND=x11
+export XDG_SESSION_TYPE=x11
+python3 marktplaats_manager.py
 EOF
-chmod +x "$LAUNCHER_SCRIPT"
+chmod +x "$APP_DIR/start-foto"
+echo "✅ start-foto aangemaakt"
 
-# Terminal commando 'mp-foto'
-SYMLINK="$HOME/.local/bin/mp-foto"
-if [ -L "$SYMLINK" ]; then
-    rm "$SYMLINK"
-fi
-ln -s "$LAUNCHER_SCRIPT" "$SYMLINK"
-chmod +x "$SYMLINK"
-
-# Desktop entry
-DESKTOP_FILE="$HOME/.local/share/applications/MarktplaatsFotoManager.desktop"
-
-cat > "$DESKTOP_FILE" << EOF
+# =========================================================
+# .desktop snelkoppeling aanmaken
+# =========================================================
+cat > "$APP_DIR/MarktplaatsFotoManager.desktop" << EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=Marktplaats Foto Manager
-Comment=Verwerk productfoto's voor Marktplaats
-Exec=$LAUNCHER_SCRIPT
-Icon=$SCRIPT_DIR/$ICON_NAME
-Path=$SCRIPT_DIR
+Comment=Bewerk productfoto's voor Marktplaats
+Exec=$APP_DIR/start-foto
+Icon=$APP_DIR/icon.png
 Terminal=false
-Categories=Graphics;Utility;
+StartupNotify=true
+StartupWMClass=marktplaats_manager
+Categories=Graphics;Photography;
 EOF
+chmod +x "$APP_DIR/MarktplaatsFotoManager.desktop"
 
-# Kopieer naar bureaublad
-if [ -d "$HOME/Bureaublad" ]; then
-    cp "$DESKTOP_FILE" "$HOME/Bureaublad/MarktplaatsFotoManager.desktop"
-elif [ -d "$HOME/Desktop" ]; then
-    cp "$DESKTOP_FILE" "$HOME/Desktop/MarktplaatsFotoManager.desktop"
-fi
-chmod +x "$HOME/Bureaublad/MarktplaatsFotoManager.desktop" 2>/dev/null || chmod +x "$HOME/Desktop/MarktplaatsFotoManager.desktop" 2>/dev/null
+# Kopieer naar het systeemmenu van de huidige gebruiker
+mkdir -p ~/.local/share/applications
+cp "$APP_DIR/MarktplaatsFotoManager.desktop" ~/.local/share/applications/
+update-desktop-database ~/.local/share/applications 2>/dev/null || true
 
 echo ""
-echo "=================================================="
-echo "✅ Installatie volledig en veilig voltooid!"
-echo "=================================================="
-echo "📍 Menu & Bureaublad: Snelkoppeling geplaatst"
-echo "💻 Terminal: Typ 'mp-foto' (in een NIEUWE terminal)"
-echo "📦 Python packages: Geïnstalleerd als gebruiker (geen systeem-breuk!)"
-echo "=================================================="
+echo "✅ Klaar! De snelkoppeling is universeel toegevoegd."
+echo "   Je kunt 'Marktplaats Foto Manager' nu vinden in je applicatiemenu."
+echo ""
+echo "📌 Alternatief: start vanuit terminal met:"
+echo "   cd $APP_DIR && ./start-foto"
