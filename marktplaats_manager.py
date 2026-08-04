@@ -1,2074 +1,1734 @@
 #!/usr/bin/env python3
 """
-Marktplaats Foto Manager - Grafische applicatie voor het verwerken van productfoto's
+Marktplaats Product Manager - Registratie & voorraadbeheer
+
+Vervangt de Google Form + Google Sheets-combinatie door een lokale app.
+Deelt exact dezelfde kolomstructuur (A-X) als auto_marktplaats.py, zodat
+beide apps dezelfde Google Sheet (of lokale XML) kunnen gebruiken.
+
+Tab 1 "Registreren"  - nieuw product invoeren, artikelnummer + map +
+                        omschrijving.txt + barcode genereren
+Tab 2 "Overzicht"     - alle producten bekijken/bewerken/verwijderen,
+                        markeren als verkocht, omzet-overzicht
 """
 
 import gi
 gi.require_version('Gtk', '3.0')
-gi.require_version('Gdk', '3.0')
-gi.require_version('GdkPixbuf', '2.0')
-from gi.repository import Gtk, Gdk, GLib, Gio, GdkPixbuf
-import subprocess
+from gi.repository import Gtk, Gdk, GLib, GdkPixbuf
 import os
-import shutil
-import glob
-import random
-import string
-import threading
-import time
-from PIL import Image
-import tempfile
-import json
-from queue import Queue
-import gc
 import sys
-import io
+import json
+import shutil
+import subprocess
+import datetime
 
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
+# ============================================
+# KOLOMSTRUCTUUR (gedeeld met auto_marktplaats.py)
+# ============================================
+# Let op: deze volgorde is bewust identiek aan wat auto_marktplaats.py
+# leest (col A=0 .. X=23). Nieuwe velden staan in de kolommen die
+# auto_marktplaats.py niet gebruikt (N t/m W), zodat beide apps dezelfde
+# sheet/xml kunnen delen zonder conflicten.
+COLUMNS = [
+    "artikelnummer",      # A (0)  - ook gebruikt door auto_marktplaats.py
+    "titel",               # B (1)  - ook gebruikt door auto_marktplaats.py
+    "categorie",            # C (2)  - ook gebruikt door auto_marktplaats.py
+    "omschrijving",          # D (3)  - ook gebruikt door auto_marktplaats.py
+    "online",                 # E (4)  - "ja"/"nee", was "reserve"
+    "lengte",                  # F (5)  - ook gebruikt door auto_marktplaats.py
+    "breedte",                  # G (6)  - ook gebruikt door auto_marktplaats.py
+    "hoogte",                     # H (7)  - ook gebruikt door auto_marktplaats.py
+    "gewicht",                     # I (8)  - ook gebruikt door auto_marktplaats.py
+    "conditie",                     # J (9)  - ook gebruikt door auto_marktplaats.py
+    "staat_details",                 # K (10) - ook gebruikt door auto_marktplaats.py (als "Schades")
+    "waarde_min",                     # L (11) - ook gebruikt door auto_marktplaats.py (als "Waarde")
+    "waarde_max",                      # M (12) - ook gebruikt door auto_marktplaats.py (waarde-extra)
+    "vraagprijs",                       # N (13)
+    "aanmaakdatum",                      # O (14)
+    "tijdsperiode",                       # P (15)
+    "opslaglocatie",                       # Q (16)
+    "sublocatie",                           # R (17)
+    "rij",                                   # S (18)
+    "folder_locatie",                         # T (19)
+    "verkocht",                                 # U (20) - "ja"/"nee"
+    "verkoopprijs",                              # V (21)
+    "verkoopdatum",                               # W (22)
+    "algemene_voorwaarden",                        # X (23) - ook gebruikt door auto_marktplaats.py
+    "advertentie_url",                              # Y (24) - nieuw, alleen ingevuld als online=ja
+    "leverwijze",                                     # Z (25) - "ophalen" of "verzenden"
+    "klant_naam",                                      # AA (26) - Marktplaatsnaam koper
+    "klant_telefoon",                                    # AB (27) - alleen bij ophalen
+    "klant_email",                                        # AC (28) - alleen bij ophalen
+    "ophaal_afspraak",                                     # AD (29) - alleen bij ophalen
+    "track_trace",                                          # AE (30) - alleen bij verzenden, optioneel
+]
+COL = {name: idx for idx, name in enumerate(COLUMNS)}
 
-def run_safe_command(cmd, timeout=300):
-    try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
-        if result.returncode != 0:
-            return False, result.stderr.decode('utf-8', errors='ignore')
-        return True, result.stdout.decode('utf-8', errors='ignore')
-    except subprocess.TimeoutExpired:
-        return False, f"Timeout na {timeout} seconden"
-    except Exception as e:
-        return False, str(e)
+CONDITIES = ["Nieuwstaat", "Zo goed als nieuw", "Gebruikt", "Beschadigd"]
+
+STAAT_DETAILS = {
+    "Nieuwstaat": ["In verpakking", "Zonder verpakking", "Beschadigde verpakking"],
+    "Zo goed als nieuw": ["Lichte gebruikerssporen", "Ongebruikt", "Goede staat"],
+    "Gebruikt": ["Gebruikerssporen", "Kleine schades zoals krassen en vlekken", "Mogelijk ontbrekende onderdelen"],
+    "Beschadigd": ["Ontbrekende onderdelen", "Zware gebruikerssporen", "Opvallende krassen, sporen en vlekken", "Werking onbekend"],
+}
+
+DEFAULT_CATEGORIEEN = [
+    "Huishouden", "Elektra/Elektronica", "Meubels", "Verlichting", "Speelgoed",
+    "Kleding/Textiel", "Boeken/Media", "Sieraden/Accessoires", "Sport & Vrije tijd",
+    "Tuin & Buiten", "Gereedschap", "Servies/Keuken", "Kunst & Decoratie", "Overig",
+]
+
+DEFAULT_TIJDSPERIODES = [
+    "Antiek (100+ jaar)", "Vintage (20-100 jaar)", "Retro", "Klassiek",
+    "Modern/Hedendaags", "Onbekend",
+]
+
+MAX_TITEL_LENGTE = 60
+
+TEXTVIEW_CSS = b"""
+textview {
+    border: 1px solid alpha(@borders, 0.6);
+    border-radius: 4px;
+}
+textview text {
+    /* Vaste, thema-onafhankelijke kleur i.p.v. @theme_base_color - die
+       bleek in dit thema hetzelfde te zijn als de vensterachtergrond,
+       waardoor er geen zichtbaar contrast was. Pas deze hex gerust aan
+       als 'ie op jouw systeem nog niet precies goed oogt. */
+    background-color: #3a3a3a;
+    color: #e8e8e8;
+    padding: 5px;
+}
+"""
 
 
-def crop_and_scale_background(bg_image_path, target_size):
-    """Schaal de achtergrondafbeelding op de kortste zijde en crop center."""
-    try:
-        bg_img = Image.open(bg_image_path)
-        target_width, target_height = target_size
+def apply_css():
+    provider = Gtk.CssProvider()
+    provider.load_from_data(TEXTVIEW_CSS)
+    screen = Gdk.Screen.get_default()
+    Gtk.StyleContext.add_provider_for_screen(
+        screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+    )
 
-        bg_width, bg_height = bg_img.size
-        target_ratio = target_width / target_height
-        bg_ratio = bg_width / bg_height
+ALGEMENE_VOORWAARDEN = """Algemene voorwaarden: 
+Wij zijn een kleine kringloopwinkel en proberen z.s.m. te reageren. Soms is het heel druk in de winkel en lukt dit niet dezelfde dag. 
 
-        if bg_ratio > target_ratio:
-            new_height = target_height
-            new_width = int(target_height * bg_ratio)
-        else:
-            new_width = target_width
-            new_height = int(target_width / bg_ratio)
+De richtprijs van een product baseren wij op bestaand aanbod en staat van het artikel met minimum/maximum schatting. 
 
-        bg_img = bg_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+Graag alleen biedingen plaatsen via de bied optie van marktplaats. Advertenties laten we vaak minimaal 2 weken online staan voordat we akkoord gaan met het hoogste aannemelijke bod. Bedankt voor uw begrip 🙏🏻 
 
-        left = (new_width - target_width) // 2
-        top = (new_height - target_height) // 2
-        right = left + target_width
-        bottom = top + target_height
+Als wij akkoord gaan met uw bod, reserveren wij het product maximaal een week voor u. U kunt het product ophalen en afrekenen in onze winkel.
 
-        bg_img = bg_img.crop((left, top, right, bottom))
-        return bg_img
-    except Exception as e:
-        print(f"Fout bij schalen achtergrond: {e}")
+U bent altijd welkom in onze winkel, maar langskomen voor de Marktplaats advertenties zonder afspraak wordt niet op prijs gesteld. Dit gaat altijd via specifieke medewerkers. 
+
+Let op: Bij ophalen in de winkel vervalt het herroepingsrecht en kun je het product ter plekke testen. 
+
+Ons adres:
+Kringloop HerNieuw 
+Willem Beukelszstraat 6B 
+3261 LV Oud-Beijerland
+
+Openingstijden Kringloop: 
+Dinsdag t/m vrijdag 10.00 – 16.00 uur 
+Zaterdag 10:00-13:00 uur 
+Zondag en maandag Gesloten"""
+
+
+def config_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def config_path():
+    return os.path.join(config_dir(), "productmanager_config.json")
+
+
+# ============================================
+# CONFIGURATIE
+# ============================================
+class ConfigManager:
+    DEFAULTS = {
+        "storage_backend": "xml",  # "xml" of "sheets" - precies EEN actief tegelijk
+        "xml_path": os.path.join(config_dir(), "producten.xml"),
+        "sheets": {
+            "sheet_url": "",
+            "credentials_file": os.path.join(config_dir(), "credentials.json"),
+        },
+        "base_folder": os.path.expanduser("~/Documents/MarktplaatsProgramma/Producten"),
+        "categorieen": DEFAULT_CATEGORIEEN,
+        "tijdsperiodes": DEFAULT_TIJDSPERIODES,
+        # opslaglocatie_codes: {weergavenaam: 1-teken-code}
+        "opslaglocatie_codes": {"Locatie A": "A", "Locatie B": "B"},
+        "sublocatie_codes": {"Sublocatie 1": "1", "Sublocatie 2": "2"},
+        "rij_codes": {"Rij 1": "1", "Rij 2": "2"},
+        "volgnummers": {},  # {prefix: laatst_gebruikte_nummer}
+        "printer": {
+            "enabled": False,
+            "print_method": "cups",
+            "printer_name": "",
+            "brother_ql_model": "QL-500",
+            "brother_ql_label": "62",
+            "brother_ql_identifier": "",
+        },
+        "barcode": {
+            # Afgestemd op 62mm continue labelrol (bv. Brother QL-serie).
+            # Pas gerust aan en test opnieuw - dit bepaalt hoe breed/hoog
+            # de barcode wordt EN hoeveel label er wordt "uitgespuugd".
+            "module_width_mm": 0.4,   # dikte van elke streep - hoger = breder totaal + beter leesbaar
+            "module_height_mm": 7.0,  # hoogte van de streepjes zelf (python-barcode default is 15mm)
+            "quiet_zone_mm": 2.0,     # witruimte links/rechts (kleiner = meer van de 62mm benut)
+        },
+    }
+
+    def __init__(self):
+        self.path = config_path()
+        self.data = self._load()
+
+    def _load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                merged = json.loads(json.dumps(self.DEFAULTS))  # deep copy
+                merged.update(loaded)
+                return merged
+            except Exception:
+                pass
+        return json.loads(json.dumps(self.DEFAULTS))
+
+    def save(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, indent=2, ensure_ascii=False)
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = value
+        self.save()
+
+
+# ============================================
+# OPSLAG-BACKENDS (XML of Google Sheets, precies 1 actief)
+# ============================================
+class StorageBackend:
+    def load_products(self):
+        raise NotImplementedError
+
+    def add_product(self, product):
+        raise NotImplementedError
+
+    def update_product(self, artikelnummer, product):
+        raise NotImplementedError
+
+    def delete_product(self, artikelnummer):
+        raise NotImplementedError
+
+
+class XmlBackend(StorageBackend):
+    def __init__(self, xml_path):
+        self.xml_path = xml_path
+
+    def _ensure_file(self):
+        if not os.path.exists(self.xml_path):
+            import xml.etree.ElementTree as ET
+            root = ET.Element("producten")
+            tree = ET.ElementTree(root)
+            os.makedirs(os.path.dirname(self.xml_path), exist_ok=True)
+            tree.write(self.xml_path, encoding="utf-8", xml_declaration=True)
+
+    def load_products(self):
+        import xml.etree.ElementTree as ET
+        self._ensure_file()
+        tree = ET.parse(self.xml_path)
+        root = tree.getroot()
+        products = []
+        for prod_el in root.findall("product"):
+            product = {}
+            for col in COLUMNS:
+                el = prod_el.find(col)
+                product[col] = el.text if el is not None and el.text else ""
+            products.append(product)
+        return products
+
+    def _write_all(self, products):
+        import xml.etree.ElementTree as ET
+        root = ET.Element("producten")
+        for product in products:
+            prod_el = ET.SubElement(root, "product")
+            for col in COLUMNS:
+                el = ET.SubElement(prod_el, col)
+                el.text = str(product.get(col, ""))
+        tree = ET.ElementTree(root)
+        os.makedirs(os.path.dirname(self.xml_path), exist_ok=True)
+        tree.write(self.xml_path, encoding="utf-8", xml_declaration=True)
+
+    def add_product(self, product):
+        products = self.load_products()
+        products.append(product)
+        self._write_all(products)
+
+    def update_product(self, artikelnummer, product):
+        products = self.load_products()
+        for i, p in enumerate(products):
+            if p.get("artikelnummer") == artikelnummer:
+                products[i] = product
+                break
+        self._write_all(products)
+
+    def delete_product(self, artikelnummer):
+        products = self.load_products()
+        products = [p for p in products if p.get("artikelnummer") != artikelnummer]
+        self._write_all(products)
+
+
+class SheetsBackend(StorageBackend):
+    def __init__(self, sheet_url, credentials_file):
+        self.sheet_url = sheet_url
+        self.credentials_file = credentials_file
+        self._client = None
+        self._worksheet = None
+
+    def _connect(self):
+        if self._worksheet is not None:
+            return self._worksheet
+        import gspread
+        from google.oauth2.service_account import Credentials
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_file(self.credentials_file, scopes=scopes)
+        self._client = gspread.authorize(creds)
+        sheet = self._client.open_by_url(self.sheet_url)
+        self._worksheet = sheet.get_worksheet(0)
+        return self._worksheet
+
+    def load_products(self):
+        ws = self._connect()
+        all_values = ws.get_all_values()
+        products = []
+        for row in all_values[1:]:
+            if not row or not row[0]:
+                continue
+            product = {}
+            for i, col in enumerate(COLUMNS):
+                product[col] = row[i] if i < len(row) else ""
+            products.append(product)
+        return products
+
+    def _product_to_row(self, product):
+        return [str(product.get(col, "")) for col in COLUMNS]
+
+    def add_product(self, product):
+        ws = self._connect()
+        ws.append_row(self._product_to_row(product))
+
+    def _find_row_number(self, ws, artikelnummer):
+        all_values = ws.get_all_values()
+        for idx, row in enumerate(all_values, start=1):
+            if row and row[0] == artikelnummer:
+                return idx
         return None
 
+    def update_product(self, artikelnummer, product):
+        ws = self._connect()
+        row_num = self._find_row_number(ws, artikelnummer)
+        if row_num is None:
+            self.add_product(product)
+            return
+        row = self._product_to_row(product)
+        ws.update(f"A{row_num}:{chr(65 + len(COLUMNS) - 1)}{row_num}", [row])
 
-class ImagePreviewWindow(Gtk.Window):
-    def __init__(self, parent, image_files):
-        super().__init__(title="Inspecteer Afbeeldingen - Transparante Achtergrond")
-        self.parent = parent
-        self.image_files = image_files
-        self.current_index = 0
-        self.current_pixbuf = None
-        self.rotation_angle = 0
-        self.original_pixbuf = None
-        self.zoom_level = 100
-        self.is_loading = False
-        self.current_image_path = None
+    def delete_product(self, artikelnummer):
+        ws = self._connect()
+        row_num = self._find_row_number(ws, artikelnummer)
+        if row_num is not None:
+            ws.delete_rows(row_num)
 
-        self.set_default_size(Gdk.Screen.width(), Gdk.Screen.height())
-        self.set_position(Gtk.WindowPosition.CENTER)
-        self.maximize()
-        self.set_border_width(10)
 
-        main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        self.add(main_vbox)
+def get_backend(config):
+    backend = config.get("storage_backend", "xml")
+    if backend == "sheets":
+        sheets_cfg = config.get("sheets", {})
+        return SheetsBackend(sheets_cfg.get("sheet_url", ""), sheets_cfg.get("credentials_file", ""))
+    return XmlBackend(config.get("xml_path"))
 
+
+# ============================================
+# HELPERS: artikelnummer, map, txt, barcode
+# ============================================
+def generate_artikelnummer(config, storage, opslaglocatie_code, sublocatie_code, rij_code):
+    """Bouwt het artikelnummer op als: locatie-prefix(3) + dag+maand(4) + volgnummer(2).
+    Bijv. A51 + 0108 (1 augustus) + 03 = A51010803.
+    Het volgnummer (01-99) telt per locatie-prefix EN per dag - begint dus
+    elke dag vanzelf weer bij 01, ook voor dezelfde locatie."""
+    prefix = f"{opslaglocatie_code}{sublocatie_code}{rij_code}"
+    datum_deel = datetime.date.today().strftime("%d%m")  # DDMM, 4 cijfers
+    teller_sleutel = f"{prefix}{datum_deel}"
+    
+    volgnummers = config.get("volgnummers", {})
+    laatste = volgnummers.get(teller_sleutel, 0)
+    
+    # Kruis-check met bestaande data, voor het geval de teller (config.json)
+    # niet meer synchroon loopt met de opslag (bv. na handmatige XML-edit
+    # of een andere computer die dezelfde sheet gebruikt).
+    try:
+        bestaande = storage.load_products()
+        for p in bestaande:
+            nr = p.get("artikelnummer", "")
+            if nr.startswith(teller_sleutel) and len(nr) == len(teller_sleutel) + 2:
+                try:
+                    val = int(nr[len(teller_sleutel):])
+                    laatste = max(laatste, val)
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    
+    nieuw_nummer = laatste + 1
+    if nieuw_nummer > 99:
+        raise ValueError(
+            f"Maximaal 99 artikelen per dag bereikt voor locatie '{prefix}' op {datum_deel}."
+        )
+    volgnummers[teller_sleutel] = nieuw_nummer
+    config.set("volgnummers", volgnummers)
+    
+    return f"{teller_sleutel}{nieuw_nummer:02d}"
+
+
+def build_txt_beschrijving(product):
+    """Genereert omschrijving.txt in het mapje van het artikelnummer.
+    Dit is BEWUST exact hetzelfde formaat als de advertentietekst die
+    auto_marktplaats.py plaatst (zie build_description() daar) - deze
+    .txt is de enige plek waar de opmaak wordt beheerd; auto_marktplaats.py
+    leest 'm rechtstreeks in plaats van de tekst zelf opnieuw op te bouwen."""
+    parts = []
+    
+    titel = product.get("titel", "")
+    if titel:
+        parts.append(titel)
+    
+    omschrijving = product.get("omschrijving", "")
+    if omschrijving:
+        parts.append(omschrijving)
+    
+    specs = []
+    lengte = product.get("lengte", "")
+    breedte = product.get("breedte", "")
+    hoogte = product.get("hoogte", "")
+    gewicht = product.get("gewicht", "")
+    if lengte or breedte or hoogte or gewicht:
+        dims = [f"{x}cm" for x in (lengte, breedte, hoogte) if x]
+        line = f"* Afmeting (LxBxH & G): {' x '.join(dims)}"
+        if gewicht:
+            line += f" & {gewicht} kg"
+        specs.append(line)
+    if product.get("conditie"):
+        specs.append(f"* Conditie/Staat: {product.get('conditie')}")
+    if product.get("staat_details"):
+        specs.append(f"* Schades: {product.get('staat_details')}")
+    waarde_min = product.get("waarde_min", "")
+    waarde_max = product.get("waarde_max", "")
+    if waarde_min:
+        line = f"* Waarde: {waarde_min}"
+        if waarde_max:
+            line += f" ~{waarde_max}"
+        specs.append(line)
+    if product.get("artikelnummer"):
+        specs.append(f"* Artikelnummer: {product.get('artikelnummer')}")
+    if specs:
+        parts.append("\n".join(specs))
+    
+    voorwaarden = product.get("algemene_voorwaarden") or ALGEMENE_VOORWAARDEN
+    parts.append(voorwaarden)
+    
+    return "\n\n".join(parts)
+
+
+def maak_product_map(config, product):
+    """Maakt (of hergebruikt) de map voor dit artikelnummer, identiek aan
+    hoe marktplaats_manager.py de map benoemt (base_folder/artikelnummer),
+    en schrijft de omschrijving.txt erin."""
+    base_folder = config.get("base_folder")
+    artikelnummer = product["artikelnummer"]
+    folder = os.path.join(base_folder, artikelnummer)
+    bestond_al = os.path.exists(folder)
+    os.makedirs(folder, exist_ok=True)
+    
+    txt_path = os.path.join(folder, "omschrijving.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(build_txt_beschrijving(product))
+    
+    return folder, bestond_al
+
+
+def genereer_barcode(artikelnummer, output_folder, barcode_config=None):
+    """Genereert een Code128-barcode-afbeelding met het artikelnummer.
+    Vereist: pip install python-barcode"""
+    try:
+        import barcode
+        from barcode.writer import ImageWriter
+        from PIL import Image as PILImage
+    except ImportError:
+        raise RuntimeError(
+            "python-barcode is niet geïnstalleerd. Installeer met:\n"
+            "pip install python-barcode --break-system-packages"
+        )
+    
+    # Compatibiliteits-fix: Pillow 10+ heeft Image.ANTIALIAS verwijderd
+    # (vervangen door Image.LANCZOS), maar python-barcode's ImageWriter
+    # verwijst er intern nog naar. Zonder deze patch crasht het genereren
+    # met "module 'PIL.Image' has no attribute 'ANTIALIAS'".
+    if not hasattr(PILImage, "ANTIALIAS"):
+        PILImage.ANTIALIAS = PILImage.LANCZOS
+    
+    barcode_config = barcode_config or {}
+    writer_options = {
+        "module_width": barcode_config.get("module_width_mm", 0.4),
+        "module_height": barcode_config.get("module_height_mm", 7.0),
+        "quiet_zone": barcode_config.get("quiet_zone_mm", 2.0),
+        "font_size": 8,
+        "text_distance": 3.0,
+        "dpi": 300,
+    }
+    code128 = barcode.get("code128", artikelnummer, writer=ImageWriter())
+    output_path = os.path.join(output_folder, f"{artikelnummer}_barcode")
+    saved_path = code128.save(output_path, options=writer_options)
+    return saved_path
+
+
+def print_barcode(image_path, printer_config):
+    """Print de barcode-afbeelding.
+    
+    Twee methoden:
+    - 'brother_ql': praat rechtstreeks (via USB) met een Brother QL-serie
+      printer met de brother_ql-library. Dit is de juiste aanpak voor een
+      continue labelrol: de library berekent zelf de correcte labellengte
+      op basis van de afbeelding, in plaats van te leunen op een vaste
+      paginagrootte uit een CUPS-driver (wat foutmeldingen/knipperen kan
+      geven als de gevraagde afmeting niet in de driver's vaste lijst zit).
+    - 'cups': gewone lp-print, GEEN custom paginagrootte (dat gaf eerder
+      een media-mismatch-fout op de QL-500). Werkt op de meeste
+      printers, maar de labellengte is dan afhankelijk van de standaard-
+      pagina-instelling van de driver.
+    """
+    methode = printer_config.get("print_method", "cups")
+    
+    if methode == "brother_ql":
+        _print_barcode_brother_ql(image_path, printer_config)
+    else:
+        _print_barcode_cups(image_path, printer_config.get("printer_name", ""))
+
+
+def _print_barcode_cups(image_path, printer_name):
+    cmd = ["lp"]
+    if printer_name:
+        cmd += ["-d", printer_name]
+    cmd += [image_path]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", errors="ignore"))
+
+
+def _print_barcode_brother_ql(image_path, printer_config):
+    try:
+        from brother_ql.conversion import convert
+        from brother_ql.backends.helpers import send
+        from brother_ql.raster import BrotherQLRaster
+    except ImportError:
+        raise RuntimeError(
+            "brother_ql is niet geïnstalleerd. Installeer met:\n"
+            "pip install brother_ql --break-system-packages"
+        )
+    
+    model = printer_config.get("brother_ql_model", "QL-500")
+    label_size = printer_config.get("brother_ql_label", "62")  # 62mm continu
+    identifier = printer_config.get("brother_ql_identifier", "")
+    if not identifier:
+        raise RuntimeError(
+            "Geen USB-identifier ingesteld voor brother_ql.\n"
+            "Vind 'm met: python3 -m brother_ql discover"
+        )
+    
+    from PIL import Image
+    with Image.open(image_path) as img:
+        qlr = BrotherQLRaster(model)
+        qlr.exception_on_warning = True
+        instructions = convert(
+            qlr=qlr,
+            images=[img],
+            label=label_size,
+            rotate="0",
+            threshold=70.0,
+            dither=False,
+            compress=False,
+            red=False,
+            cut=True,
+        )
+        send(instructions=instructions, printer_identifier=identifier, backend_identifier="pyusb", blocking=True)
+
+
+def get_cups_printers():
+    """Haalt beschikbare CUPS-printers op (Linux)."""
+    try:
+        result = subprocess.run(["lpstat", "-p"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        printers = []
+        for line in result.stdout.decode("utf-8", errors="ignore").splitlines():
+            if line.startswith("printer "):
+                printers.append(line.split()[1])
+        return printers
+    except Exception:
+        return []
+
+
+# ============================================
+# INSTELLINGEN-DIALOOG
+# ============================================
+class SettingsDialog(Gtk.Dialog):
+    def __init__(self, parent, config):
+        super().__init__(title="Instellingen", transient_for=parent, flags=0)
+        self.config = config
+        self.set_default_size(560, 640)
+        self.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        
+        box = self.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(15)
+        
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        box.pack_start(scrolled, True, True, 0)
+        
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        inner.set_border_width(5)
+        scrolled.add(inner)
+        
+        # --- Opslagmethode ---
+        inner.pack_start(self._section_label("Opslagmethode (kies er één)"), False, False, 0)
+        
+        self.backend_combo = Gtk.ComboBoxText()
+        self.backend_combo.append("xml", "Lokaal XML-bestand")
+        self.backend_combo.append("sheets", "Google Sheets")
+        self.backend_combo.set_active_id(config.get("storage_backend", "xml"))
+        inner.pack_start(self.backend_combo, False, False, 0)
+        
+        warning = Gtk.Label()
+        warning.set_markup("<small><i>⚠️ Zorg dat deze keuze overeenkomt met wat auto_marktplaats.py gebruikt - beide apps moeten dezelfde opslag lezen.</i></small>")
+        warning.set_xalign(0)
+        warning.set_line_wrap(True)
+        inner.pack_start(warning, False, False, 0)
+        
+        inner.pack_start(Gtk.Label(label="XML-bestandspad:"), False, False, 0)
+        self.xml_path_entry = Gtk.Entry()
+        self.xml_path_entry.set_text(config.get("xml_path", ""))
+        inner.pack_start(self.xml_path_entry, False, False, 0)
+        
+        inner.pack_start(Gtk.Label(label="Google Sheets URL:"), False, False, 0)
+        self.sheet_url_entry = Gtk.Entry()
+        self.sheet_url_entry.set_text(config.get("sheets", {}).get("sheet_url", ""))
+        inner.pack_start(self.sheet_url_entry, False, False, 0)
+        
+        inner.pack_start(Gtk.Label(label="credentials.json pad:"), False, False, 0)
+        self.creds_entry = Gtk.Entry()
+        self.creds_entry.set_text(config.get("sheets", {}).get("credentials_file", ""))
+        inner.pack_start(self.creds_entry, False, False, 0)
+        
+        inner.pack_start(Gtk.Separator(), False, False, 5)
+        
+        # --- Basis-map ---
+        inner.pack_start(self._section_label("Basismap voor productmappen"), False, False, 0)
+        base_warn = Gtk.Label()
+        base_warn.set_markup("<small><i>⚠️ Zorg dat dit exact dezelfde basismap is als in marktplaats_manager.py, anders maakt die een nieuwe/andere map aan voor hetzelfde artikelnummer.</i></small>")
+        base_warn.set_xalign(0)
+        base_warn.set_line_wrap(True)
+        inner.pack_start(base_warn, False, False, 0)
+        
+        self.base_folder_entry = Gtk.Entry()
+        self.base_folder_entry.set_text(config.get("base_folder", ""))
+        inner.pack_start(self.base_folder_entry, False, False, 0)
+        
+        inner.pack_start(Gtk.Separator(), False, False, 5)
+        
+        # --- Categorieën ---
+        inner.pack_start(self._section_label("Categorieën (één per regel)"), False, False, 0)
+        self.categorieen_view = Gtk.TextView()
+        self.categorieen_view.get_buffer().set_text("\n".join(config.get("categorieen", DEFAULT_CATEGORIEEN)))
+        cat_scroll = Gtk.ScrolledWindow()
+        cat_scroll.set_size_request(-1, 100)
+        cat_scroll.add(self.categorieen_view)
+        inner.pack_start(cat_scroll, False, False, 0)
+        
+        # --- Tijdsperiodes ---
+        inner.pack_start(self._section_label("Tijdsperiodes (één per regel)"), False, False, 0)
+        self.tijdsperiodes_view = Gtk.TextView()
+        self.tijdsperiodes_view.get_buffer().set_text("\n".join(config.get("tijdsperiodes", DEFAULT_TIJDSPERIODES)))
+        tp_scroll = Gtk.ScrolledWindow()
+        tp_scroll.set_size_request(-1, 100)
+        tp_scroll.add(self.tijdsperiodes_view)
+        inner.pack_start(tp_scroll, False, False, 0)
+        
+        inner.pack_start(Gtk.Separator(), False, False, 5)
+        
+        # --- Opslaglocatie-codes ---
+        inner.pack_start(self._section_label("Opslaglocatie-codes (naam=code, 1 teken, één per regel)"), False, False, 0)
+        loc_hint = Gtk.Label()
+        loc_hint.set_markup("<small><i>De code van Opslaglocatie + Sublocatie + Rij vormt samen de eerste 3 tekens van het artikelnummer. Bijv: Zolder=Z</i></small>")
+        loc_hint.set_xalign(0)
+        loc_hint.set_line_wrap(True)
+        inner.pack_start(loc_hint, False, False, 0)
+        
+        self.opslaglocatie_view = Gtk.TextView()
+        self.opslaglocatie_view.get_buffer().set_text(
+            "\n".join(f"{k}={v}" for k, v in config.get("opslaglocatie_codes", {}).items())
+        )
+        loc_scroll = Gtk.ScrolledWindow()
+        loc_scroll.set_size_request(-1, 80)
+        loc_scroll.add(self.opslaglocatie_view)
+        inner.pack_start(loc_scroll, False, False, 0)
+        
+        inner.pack_start(Gtk.Label(label="Sublocatie-codes (naam=code):"), False, False, 0)
+        self.sublocatie_view = Gtk.TextView()
+        self.sublocatie_view.get_buffer().set_text(
+            "\n".join(f"{k}={v}" for k, v in config.get("sublocatie_codes", {}).items())
+        )
+        sub_scroll = Gtk.ScrolledWindow()
+        sub_scroll.set_size_request(-1, 80)
+        sub_scroll.add(self.sublocatie_view)
+        inner.pack_start(sub_scroll, False, False, 0)
+        
+        inner.pack_start(Gtk.Label(label="Rij-codes (naam=code):"), False, False, 0)
+        self.rij_view = Gtk.TextView()
+        self.rij_view.get_buffer().set_text(
+            "\n".join(f"{k}={v}" for k, v in config.get("rij_codes", {}).items())
+        )
+        rij_scroll = Gtk.ScrolledWindow()
+        rij_scroll.set_size_request(-1, 80)
+        rij_scroll.add(self.rij_view)
+        inner.pack_start(rij_scroll, False, False, 0)
+        
+        inner.pack_start(Gtk.Separator(), False, False, 5)
+        
+        # --- Labelprinter ---
+        inner.pack_start(self._section_label("Labelprinter (barcode)"), False, False, 0)
+        printer_hint = Gtk.Label()
+        printer_hint.set_markup("<small><i>Indien uitgeschakeld wordt alleen een barcode-afbeelding opgeslagen in de productmap.</i></small>")
+        printer_hint.set_xalign(0)
+        printer_hint.set_line_wrap(True)
+        inner.pack_start(printer_hint, False, False, 0)
+        
+        self.printer_enabled_check = Gtk.CheckButton(label="Direct printen inschakelen")
+        self.printer_enabled_check.set_active(config.get("printer", {}).get("enabled", False))
+        inner.pack_start(self.printer_enabled_check, False, False, 0)
+        
+        printer_cfg = config.get("printer", {})
+        
+        method_row = Gtk.Box(spacing=5)
+        method_row.pack_start(Gtk.Label(label="Methode:"), False, False, 0)
+        self.print_method_combo = Gtk.ComboBoxText()
+        self.print_method_combo.append("cups", "CUPS (lp) - algemeen")
+        self.print_method_combo.append("brother_ql", "Brother QL direct via USB (brother_ql)")
+        self.print_method_combo.set_active_id(printer_cfg.get("print_method", "cups"))
+        self.print_method_combo.connect("changed", self._on_print_method_changed)
+        method_row.pack_start(self.print_method_combo, False, False, 0)
+        inner.pack_start(method_row, False, False, 0)
+        
+        # CUPS-specifieke velden
+        self.cups_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        inner.pack_start(self.cups_box, False, False, 0)
+        
+        printer_row = Gtk.Box(spacing=5)
+        printer_row.pack_start(Gtk.Label(label="Printer:"), False, False, 0)
+        self.printer_combo = Gtk.ComboBoxText()
+        for p in get_cups_printers():
+            self.printer_combo.append_text(p)
+        huidige_printer = printer_cfg.get("printer_name", "")
+        if huidige_printer:
+            self.printer_combo.prepend_text(huidige_printer)
+        self.printer_combo.set_active(0)
+        printer_row.pack_start(self.printer_combo, True, True, 0)
+        
+        refresh_btn = Gtk.Button(label="🔄")
+        refresh_btn.connect("clicked", self._refresh_printers)
+        printer_row.pack_start(refresh_btn, False, False, 0)
+        
+        self.cups_box.pack_start(printer_row, False, False, 0)
+        cups_hint = Gtk.Label()
+        cups_hint.set_markup("<small><i>⚠️ Op de QL-500 gaf een aangepaste paginagrootte een media-mismatch-fout (snel knipperend lampje). Gebruik hiervoor liever de brother_ql-methode hieronder.</i></small>")
+        cups_hint.set_xalign(0)
+        cups_hint.set_line_wrap(True)
+        self.cups_box.pack_start(cups_hint, False, False, 0)
+        
+        # brother_ql-specifieke velden
+        self.brother_ql_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        inner.pack_start(self.brother_ql_box, False, False, 0)
+        
+        bq_grid = Gtk.Grid()
+        bq_grid.set_column_spacing(10)
+        bq_grid.set_row_spacing(5)
+        self.brother_ql_box.pack_start(bq_grid, False, False, 0)
+        
+        bq_grid.attach(Gtk.Label(label="Model:", xalign=0), 0, 0, 1, 1)
+        self.bq_model_entry = Gtk.Entry()
+        self.bq_model_entry.set_text(printer_cfg.get("brother_ql_model", "QL-500"))
+        bq_grid.attach(self.bq_model_entry, 1, 0, 1, 1)
+        
+        bq_grid.attach(Gtk.Label(label="Labelformaat:", xalign=0), 0, 1, 1, 1)
+        self.bq_label_entry = Gtk.Entry()
+        self.bq_label_entry.set_text(printer_cfg.get("brother_ql_label", "62"))
+        bq_grid.attach(self.bq_label_entry, 1, 1, 1, 1)
+        bq_label_hint = Gtk.Label()
+        bq_label_hint.set_markup("<small><i>'62' = 62mm continue rol</i></small>")
+        bq_label_hint.set_xalign(0)
+        bq_grid.attach(bq_label_hint, 2, 1, 1, 1)
+        
+        bq_grid.attach(Gtk.Label(label="USB-identifier:", xalign=0), 0, 2, 1, 1)
+        self.bq_identifier_entry = Gtk.Entry()
+        self.bq_identifier_entry.set_text(printer_cfg.get("brother_ql_identifier", ""))
+        self.bq_identifier_entry.set_placeholder_text("bijv. usb://0x04f9:0x2015/000M6Z401370")
+        bq_grid.attach(self.bq_identifier_entry, 1, 2, 1, 1)
+        
+        bq_find_btn = Gtk.Button(label="🔍 Zoek printer")
+        bq_find_btn.connect("clicked", self._discover_brother_ql)
+        self.brother_ql_box.pack_start(bq_find_btn, False, False, 0)
+        
+        self._on_print_method_changed(self.print_method_combo)
+        
+
+        # --- Barcode-afmetingen ---
+        size_hint = Gtk.Label()
+        size_hint.set_markup(
+            "<small><i>Voor labelprinters (bv. Brother QL op 62mm rol): "
+            "de paginagrootte bij het printen wordt automatisch gelijk gezet aan "
+            "de afbeelding, dus deze instellingen bepalen direct hoeveel label "
+            "er wordt uitgevoerd.</i></small>"
+        )
+        size_hint.set_xalign(0)
+        size_hint.set_line_wrap(True)
+        size_hint.set_margin_top(8)
+        inner.pack_start(size_hint, False, False, 0)
+        
+        barcode_cfg = config.get("barcode", {})
+        
+        size_grid = Gtk.Grid()
+        size_grid.set_column_spacing(10)
+        size_grid.set_row_spacing(5)
+        inner.pack_start(size_grid, False, False, 0)
+        
+        size_grid.attach(Gtk.Label(label="Streepdikte (mm):", xalign=0), 0, 0, 1, 1)
+        self.module_width_entry = Gtk.Entry()
+        self.module_width_entry.set_text(str(barcode_cfg.get("module_width_mm", 0.4)))
+        size_grid.attach(self.module_width_entry, 1, 0, 1, 1)
+        width_hint = Gtk.Label()
+        width_hint.set_markup("<small><i>hoger = breder totaal + beter leesbaar</i></small>")
+        width_hint.set_xalign(0)
+        size_grid.attach(width_hint, 2, 0, 1, 1)
+        
+        size_grid.attach(Gtk.Label(label="Streephoogte (mm):", xalign=0), 0, 1, 1, 1)
+        self.module_height_entry = Gtk.Entry()
+        self.module_height_entry.set_text(str(barcode_cfg.get("module_height_mm", 7.0)))
+        size_grid.attach(self.module_height_entry, 1, 1, 1, 1)
+        height_hint = Gtk.Label()
+        height_hint.set_markup("<small><i>standaard (python-barcode) is 15mm</i></small>")
+        height_hint.set_xalign(0)
+        size_grid.attach(height_hint, 2, 1, 1, 1)
+        
+        size_grid.attach(Gtk.Label(label="Marge/quiet zone (mm):", xalign=0), 0, 2, 1, 1)
+        self.quiet_zone_entry = Gtk.Entry()
+        self.quiet_zone_entry.set_text(str(barcode_cfg.get("quiet_zone_mm", 2.0)))
+        size_grid.attach(self.quiet_zone_entry, 1, 2, 1, 1)
+        qz_hint = Gtk.Label()
+        qz_hint.set_markup("<small><i>kleiner = meer van de rolbreedte benut</i></small>")
+        qz_hint.set_xalign(0)
+        size_grid.attach(qz_hint, 2, 2, 1, 1)
+        
+        self.show_all()
+    
+    def _on_print_method_changed(self, widget):
+        is_brother_ql = self.print_method_combo.get_active_id() == "brother_ql"
+        self.cups_box.set_visible(not is_brother_ql)
+        self.brother_ql_box.set_visible(is_brother_ql)
+    
+    def _discover_brother_ql(self, widget):
+        try:
+            result = subprocess.run(
+                ["python3", "-m", "brother_ql", "discover"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10
+            )
+            output = result.stdout.decode("utf-8", errors="ignore").strip()
+            if output:
+                # pak de eerste gevonden identifier
+                for line in output.splitlines():
+                    if "usb://" in line:
+                        identifier = line.strip().split()[0] if " " not in line.split("usb://")[0] else line.strip()
+                        self.bq_identifier_entry.set_text(line.strip())
+                        break
+                self._toon_info_dialoog(f"Gevonden:\n{output}")
+            else:
+                self._toon_info_dialoog("Geen brother_ql-printer gevonden. Is de printer aan en verbonden via USB?")
+        except FileNotFoundError:
+            self._toon_info_dialoog("brother_ql is niet geïnstalleerd. Installeer met:\npip install brother_ql --break-system-packages")
+        except Exception as e:
+            self._toon_info_dialoog(f"Fout bij zoeken: {e}")
+    
+    def _toon_info_dialoog(self, msg):
+        dialog = Gtk.MessageDialog(
+            transient_for=self, flags=0, message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK, text=msg
+        )
+        dialog.run()
+        dialog.destroy()
+    
+    def _refresh_printers(self, widget):
+        self.printer_combo.remove_all()
+        for p in get_cups_printers():
+            self.printer_combo.append_text(p)
+        self.printer_combo.set_active(0)
+    
+    def _section_label(self, text):
+        label = Gtk.Label()
+        label.set_markup(f"<b>{text}</b>")
+        label.set_xalign(0)
+        return label
+    
+    def _parse_key_value_lines(self, textview):
+        buf = textview.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        result = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                result[k.strip()] = v.strip()
+        return result
+    
+    def _parse_lines(self, textview):
+        buf = textview.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        return [l.strip() for l in text.splitlines() if l.strip()]
+    
+    def apply_to_config(self):
+        self.config.set("storage_backend", self.backend_combo.get_active_id())
+        self.config.set("xml_path", self.xml_path_entry.get_text().strip())
+        self.config.set("sheets", {
+            "sheet_url": self.sheet_url_entry.get_text().strip(),
+            "credentials_file": self.creds_entry.get_text().strip(),
+        })
+        self.config.set("base_folder", self.base_folder_entry.get_text().strip())
+        self.config.set("categorieen", self._parse_lines(self.categorieen_view))
+        self.config.set("tijdsperiodes", self._parse_lines(self.tijdsperiodes_view))
+        self.config.set("opslaglocatie_codes", self._parse_key_value_lines(self.opslaglocatie_view))
+        self.config.set("sublocatie_codes", self._parse_key_value_lines(self.sublocatie_view))
+        self.config.set("rij_codes", self._parse_key_value_lines(self.rij_view))
+        printer_name = self.printer_combo.get_active_text() or ""
+        self.config.set("printer", {
+            "enabled": self.printer_enabled_check.get_active(),
+            "print_method": self.print_method_combo.get_active_id() or "cups",
+            "printer_name": printer_name,
+            "brother_ql_model": self.bq_model_entry.get_text().strip(),
+            "brother_ql_label": self.bq_label_entry.get_text().strip(),
+            "brother_ql_identifier": self.bq_identifier_entry.get_text().strip(),
+        })
+        
+        def _safe_float(entry, default):
+            try:
+                return float(entry.get_text().strip().replace(",", "."))
+            except ValueError:
+                return default
+        
+        self.config.set("barcode", {
+            "module_width_mm": _safe_float(self.module_width_entry, 0.4),
+            "module_height_mm": _safe_float(self.module_height_entry, 7.0),
+            "quiet_zone_mm": _safe_float(self.quiet_zone_entry, 2.0),
+        })
+
+
+# ============================================
+# TAB 1: REGISTREREN
+# ============================================
+class RegistreerTab(Gtk.Box):
+    def __init__(self, main_window):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.main_window = main_window
+        self.config = main_window.config
+        self.set_border_width(15)
+        
+        self.condition_checks = {}  # widgets per staat-detail optie
+        self.condition_box = None
+        
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.pack_start(scrolled, True, True, 0)
+        
+        form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        form.set_border_width(5)
+        scrolled.add(form)
+        
         # Titel
-        title_box = Gtk.Box(spacing=10)
-        main_vbox.pack_start(title_box, False, False, 0)
-
-        title_label = Gtk.Label()
-        title_label.set_markup("<span size='large' weight='bold'>Inspecteer Afbeeldingen</span>")
-        title_box.pack_start(title_label, True, True, 0)
-
+        form.pack_start(self._label("Titel (max 60 tekens)"), False, False, 0)
+        title_row = Gtk.Box(spacing=5)
+        self.titel_entry = Gtk.Entry()
+        self.titel_entry.set_max_length(MAX_TITEL_LENGTE)
+        self.titel_entry.connect("changed", self._on_titel_changed)
+        title_row.pack_start(self.titel_entry, True, True, 0)
+        self.titel_counter = Gtk.Label(label=f"0/{MAX_TITEL_LENGTE}")
+        title_row.pack_start(self.titel_counter, False, False, 0)
+        form.pack_start(title_row, False, False, 0)
+        
+        # Omschrijving
+        form.pack_start(self._label("Omschrijving"), False, False, 0)
+        self.omschrijving_view = Gtk.TextView()
+        self.omschrijving_view.set_wrap_mode(Gtk.WrapMode.WORD)
+        omschrijving_scroll = Gtk.ScrolledWindow()
+        omschrijving_scroll.set_size_request(-1, 100)
+        omschrijving_scroll.add(self.omschrijving_view)
+        form.pack_start(omschrijving_scroll, False, False, 0)
+        
+        # Categorie & Tijdsperiode
+        cat_row = Gtk.Box(spacing=10)
+        cat_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        cat_col.pack_start(self._label("Categorie"), False, False, 0)
+        self.categorie_combo = Gtk.ComboBoxText.new_with_entry()
+        for c in self.config.get("categorieen", DEFAULT_CATEGORIEEN):
+            self.categorie_combo.append_text(c)
+        cat_col.pack_start(self.categorie_combo, False, False, 0)
+        cat_row.pack_start(cat_col, True, True, 0)
+        
+        tp_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        tp_col.pack_start(self._label("Tijdsperiode"), False, False, 0)
+        self.tijdsperiode_combo = Gtk.ComboBoxText.new_with_entry()
+        for t in self.config.get("tijdsperiodes", DEFAULT_TIJDSPERIODES):
+            self.tijdsperiode_combo.append_text(t)
+        tp_col.pack_start(self.tijdsperiode_combo, False, False, 0)
+        cat_row.pack_start(tp_col, True, True, 0)
+        form.pack_start(cat_row, False, False, 0)
+        
+        # Conditie
+        form.pack_start(self._label("Staat van het artikel"), False, False, 0)
+        self.conditie_combo = Gtk.ComboBoxText()
+        for c in CONDITIES:
+            self.conditie_combo.append_text(c)
+        self.conditie_combo.connect("changed", self._on_conditie_changed)
+        form.pack_start(self.conditie_combo, False, False, 0)
+        
+        self.condition_details_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        form.pack_start(self.condition_details_container, False, False, 0)
+        
+        self.staat_details_extra_entry = Gtk.Entry()
+        self.staat_details_extra_entry.set_placeholder_text("Overige staat-details (optioneel, vrije tekst)")
+        form.pack_start(self.staat_details_extra_entry, False, False, 0)
+        
+        # Afmetingen & gewicht
+        form.pack_start(self._label("Afmetingen (cm) en gewicht (kg)"), False, False, 0)
+        dim_row = Gtk.Box(spacing=5)
+        self.lengte_entry = self._number_entry("Lengte")
+        self.breedte_entry = self._number_entry("Breedte")
+        self.hoogte_entry = self._number_entry("Hoogte")
+        self.gewicht_entry = self._number_entry("Gewicht")
+        for e in (self.lengte_entry, self.breedte_entry, self.hoogte_entry, self.gewicht_entry):
+            dim_row.pack_start(e, True, True, 0)
+        form.pack_start(dim_row, False, False, 0)
+        
+        # Waarde & vraagprijs
+        form.pack_start(self._label("Geschatte waarde en vraagprijs (€)"), False, False, 0)
+        waarde_row = Gtk.Box(spacing=5)
+        self.waarde_min_entry = self._number_entry("Min. waarde")
+        self.waarde_max_entry = self._number_entry("Max. waarde")
+        self.vraagprijs_entry = self._number_entry("Vraagprijs")
+        for e in (self.waarde_min_entry, self.waarde_max_entry, self.vraagprijs_entry):
+            waarde_row.pack_start(e, True, True, 0)
+        form.pack_start(waarde_row, False, False, 0)
+        
+        # Opslaglocatie / Sublocatie / Rij
+        form.pack_start(self._label("Opslaglocatie (bepaalt de eerste 3 tekens van het artikelnummer)"), False, False, 0)
+        loc_row = Gtk.Box(spacing=5)
+        self.opslaglocatie_combo = Gtk.ComboBoxText()
+        for naam in self.config.get("opslaglocatie_codes", {}).keys():
+            self.opslaglocatie_combo.append_text(naam)
+        loc_row.pack_start(self.opslaglocatie_combo, True, True, 0)
+        
+        self.sublocatie_combo = Gtk.ComboBoxText()
+        for naam in self.config.get("sublocatie_codes", {}).keys():
+            self.sublocatie_combo.append_text(naam)
+        loc_row.pack_start(self.sublocatie_combo, True, True, 0)
+        
+        self.rij_combo = Gtk.ComboBoxText()
+        for naam in self.config.get("rij_codes", {}).keys():
+            self.rij_combo.append_text(naam)
+        loc_row.pack_start(self.rij_combo, True, True, 0)
+        form.pack_start(loc_row, False, False, 0)
+        
+        warning_label = Gtk.Label()
+        warning_label.set_markup(
+            "<small><i>⚠️ Zorg dat de basismap-instelling overeenkomt met marktplaats_manager, "
+            "zodat die hetzelfde mapje voor dit artikelnummer hergebruikt (de map bestaat dan al).</i></small>"
+        )
+        warning_label.set_xalign(0)
+        warning_label.set_line_wrap(True)
+        form.pack_start(warning_label, False, False, 5)
+        
+        # Barcode
+        self.barcode_check = Gtk.CheckButton(label="Barcode genereren bij opslaan")
+        self.barcode_check.set_active(True)
+        form.pack_start(self.barcode_check, False, False, 0)
+        
+        # Opslaan-knop
+        self.opslaan_btn = Gtk.Button(label="💾 Product registreren")
+        self.opslaan_btn.connect("clicked", self._on_opslaan)
+        form.pack_start(self.opslaan_btn, False, False, 10)
+        
         self.status_label = Gtk.Label()
         self.status_label.set_xalign(0)
-        title_box.pack_start(self.status_label, True, True, 10)
-
-        # Scrollbare afbeelding
-        scrolled_window = Gtk.ScrolledWindow()
-        scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scrolled_window.set_shadow_type(Gtk.ShadowType.IN)
-        main_vbox.pack_start(scrolled_window, True, True, 0)
-
-        self.event_box = Gtk.EventBox()
-        self.event_box.set_events(Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
-        self.event_box.connect("scroll-event", self.on_scroll_zoom)
-        scrolled_window.add(self.event_box)
-
-        self.image = Gtk.Image()
-        self.event_box.add(self.image)
-
-        # Toolbar
-        toolbar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        toolbar_box.set_size_request(-1, 140)
-        main_vbox.pack_start(toolbar_box, False, False, 0)
-
-        # Rotatie + Zoom
-        control_row1 = Gtk.Box(spacing=10)
-        toolbar_box.pack_start(control_row1, False, False, 0)
-
-        # Rotatie
-        rotate_frame = Gtk.Frame(label="Rotatie")
-        rotate_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        rotate_frame.add(rotate_box)
-        control_row1.pack_start(rotate_frame, False, False, 0)
-
-        rotate_btn_box = Gtk.Box(spacing=5)
-        rotate_box.pack_start(rotate_btn_box, False, False, 0)
-
-        self.rotate_left_btn = Gtk.Button(label="↺ -90°")
-        self.rotate_left_btn.connect("clicked", self.rotate_left)
-        rotate_btn_box.pack_start(self.rotate_left_btn, False, False, 0)
-
-        self.rotate_right_btn = Gtk.Button(label="↻ +90°")
-        self.rotate_right_btn.connect("clicked", self.rotate_right)
-        rotate_btn_box.pack_start(self.rotate_right_btn, False, False, 0)
-
-        self.rotate_reset_btn = Gtk.Button(label="⟲ Reset")
-        self.rotate_reset_btn.connect("clicked", self.reset_rotation)
-        rotate_btn_box.pack_start(self.rotate_reset_btn, False, False, 0)
-
-        self.rotation_label = Gtk.Label(label="0°")
-        rotate_btn_box.pack_start(self.rotation_label, False, False, 10)
-
-        rot_scale_box = Gtk.Box(spacing=5)
-        rotate_box.pack_start(rot_scale_box, False, False, 0)
-
-        self.rotation_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 360, 1)
-        self.rotation_scale.set_value(0)
-        self.rotation_scale.set_size_request(200, -1)
-        self.rotation_scale.connect("value-changed", self.on_rotation_scale_changed)
-        rot_scale_box.pack_start(self.rotation_scale, True, True, 0)
-
-        # Zoom
-        zoom_frame = Gtk.Frame(label="Zoom")
-        zoom_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        zoom_frame.add(zoom_box)
-        control_row1.pack_start(zoom_frame, False, False, 0)
-
-        zoom_btn_box = Gtk.Box(spacing=5)
-        zoom_box.pack_start(zoom_btn_box, False, False, 0)
-
-        self.zoom_out_btn = Gtk.Button(label="🔍−")
-        self.zoom_out_btn.connect("clicked", self.zoom_out)
-        zoom_btn_box.pack_start(self.zoom_out_btn, False, False, 0)
-
-        self.zoom_in_btn = Gtk.Button(label="🔍+")
-        self.zoom_in_btn.connect("clicked", self.zoom_in)
-        zoom_btn_box.pack_start(self.zoom_in_btn, False, False, 0)
-
-        self.zoom_fit_btn = Gtk.Button(label="⟐ Passend")
-        self.zoom_fit_btn.connect("clicked", self.zoom_fit)
-        zoom_btn_box.pack_start(self.zoom_fit_btn, False, False, 0)
-
-        self.zoom_100_btn = Gtk.Button(label="100%")
-        self.zoom_100_btn.connect("clicked", self.zoom_100)
-        zoom_btn_box.pack_start(self.zoom_100_btn, False, False, 0)
-
-        self.zoom_label = Gtk.Label(label="100%")
-        zoom_btn_box.pack_start(self.zoom_label, False, False, 10)
-
-        zoom_scale_box = Gtk.Box(spacing=5)
-        zoom_box.pack_start(zoom_scale_box, False, False, 0)
-
-        self.zoom_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 10, 400, 1)
-        self.zoom_scale.set_value(100)
-        self.zoom_scale.set_size_request(200, -1)
-        self.zoom_scale.connect("value-changed", self.on_zoom_scale_changed)
-        zoom_scale_box.pack_start(self.zoom_scale, True, True, 0)
-
-        zoom_percent_label = Gtk.Label(label="%")
-        zoom_scale_box.pack_start(zoom_percent_label, False, False, 0)
-
-        # Navigatie
-        control_row2 = Gtk.Box(spacing=10)
-        toolbar_box.pack_start(control_row2, False, False, 0)
-
-        nav_frame = Gtk.Frame(label="Navigatie")
-        nav_box = Gtk.Box(spacing=5)
-        nav_frame.add(nav_box)
-        control_row2.pack_start(nav_frame, False, False, 0)
-
-        self.prev_btn = Gtk.Button(label="◀ Vorige")
-        self.prev_btn.connect("clicked", self.prev_image)
-        nav_box.pack_start(self.prev_btn, False, False, 0)
-
-        self.next_btn = Gtk.Button(label="Volgende ▶")
-        self.next_btn.connect("clicked", self.next_image)
-        nav_box.pack_start(self.next_btn, False, False, 0)
-
-        self.progress_label = Gtk.Label(label="1/1")
-        nav_box.pack_start(self.progress_label, False, False, 10)
-
-        info_frame = Gtk.Frame(label="Informatie")
-        info_box = Gtk.Box(spacing=5)
-        info_frame.add(info_box)
-        control_row2.pack_start(info_frame, False, False, 0)
-
-        self.image_info_label = Gtk.Label(label="")
-        info_box.pack_start(self.image_info_label, False, False, 0)
-
-        action_frame = Gtk.Frame(label="Acties")
-        action_box = Gtk.Box(spacing=5)
-        action_frame.add(action_box)
-        control_row2.pack_start(action_frame, False, False, 0)
-
-        self.open_gimp_btn = Gtk.Button(label="🖌 Open in GIMP")
-        self.open_gimp_btn.connect("clicked", self.open_in_gimp)
-        action_box.pack_start(self.open_gimp_btn, False, False, 0)
-
-        self.refresh_btn = Gtk.Button(label="⟳ Vernieuw")
-        self.refresh_btn.connect("clicked", self.refresh_current)
-        action_box.pack_start(self.refresh_btn, False, False, 0)
-
-        # Proces knoppen
-        control_row3 = Gtk.Box(spacing=10)
-        toolbar_box.pack_start(control_row3, False, False, 0)
-
-        process_frame = Gtk.Frame(label="Verwerking")
-        process_box = Gtk.Box(spacing=20)
-        process_frame.add(process_box)
-        control_row3.pack_start(process_frame, True, True, 0)
-
-        self.cancel_btn = Gtk.Button(label="❌ Annuleren")
-        self.cancel_btn.connect("clicked", self.cancel_processing)
-        process_box.pack_start(self.cancel_btn, False, False, 0)
-
-        self.continue_btn = Gtk.Button(label="✅ Proces Voortzetten")
-        self.continue_btn.get_style_context().add_class("suggested-action")
-        self.continue_btn.connect("clicked", self.continue_processing)
-        process_box.pack_start(self.continue_btn, False, False, 0)
-
-        # Tooltips
-        self.rotate_left_btn.set_tooltip_text("Roteer 90 graden linksom")
-        self.rotate_right_btn.set_tooltip_text("Roteer 90 graden rechtsom")
-        self.rotate_reset_btn.set_tooltip_text("Reset rotatie naar 0 graden")
-        self.rotation_scale.set_tooltip_text("Sleep om te roteren (0-360 graden)")
-        self.zoom_in_btn.set_tooltip_text("Inzoomen (+10%)")
-        self.zoom_out_btn.set_tooltip_text("Uitzoomen (-10%)")
-        self.zoom_fit_btn.set_tooltip_text("Pas afbeelding aan venster aan")
-        self.zoom_100_btn.set_tooltip_text("Zet zoom naar 100%")
-        self.zoom_scale.set_tooltip_text("Sleep om te zoomen (10-400%)")
-
-        GLib.idle_add(self.load_first_image)
-        self.show_all()
-
-    def load_first_image(self):
-        self.load_image(0)
-        return False
-
-    def on_scroll_zoom(self, widget, event):
-        if event.direction == Gdk.ScrollDirection.UP:
-            self.zoom_in(None)
-            return True
-        elif event.direction == Gdk.ScrollDirection.DOWN:
-            self.zoom_out(None)
-            return True
-        return False
-
-    def on_rotation_scale_changed(self, widget):
-        if not self.original_pixbuf:
+        self.status_label.set_line_wrap(True)
+        form.pack_start(self.status_label, False, False, 0)
+        
+        self._on_conditie_changed(self.conditie_combo)
+    
+    def _label(self, text):
+        label = Gtk.Label()
+        label.set_markup(f"<b>{text}</b>")
+        label.set_xalign(0)
+        return label
+    
+    def _number_entry(self, placeholder):
+        entry = Gtk.Entry()
+        entry.set_placeholder_text(placeholder)
+        return entry
+    
+    def _on_titel_changed(self, widget):
+        length = len(widget.get_text())
+        self.titel_counter.set_text(f"{length}/{MAX_TITEL_LENGTE}")
+    
+    def _on_conditie_changed(self, widget):
+        for child in self.condition_details_container.get_children():
+            self.condition_details_container.remove(child)
+        self.condition_checks = {}
+        
+        conditie = widget.get_active_text()
+        opties = STAAT_DETAILS.get(conditie, [])
+        for optie in opties:
+            check = Gtk.CheckButton(label=optie)
+            self.condition_checks[optie] = check
+            self.condition_details_container.pack_start(check, False, False, 0)
+        self.condition_details_container.show_all()
+    
+    def _verzamel_staat_details(self):
+        geselecteerd = [naam for naam, check in self.condition_checks.items() if check.get_active()]
+        extra = self.staat_details_extra_entry.get_text().strip()
+        if extra:
+            geselecteerd.append(extra)
+        return ", ".join(geselecteerd)
+    
+    def _reset_form(self):
+        self.titel_entry.set_text("")
+        self.omschrijving_view.get_buffer().set_text("")
+        self.categorie_combo.get_child().set_text("")
+        self.tijdsperiode_combo.get_child().set_text("")
+        self.conditie_combo.set_active(0)
+        self.staat_details_extra_entry.set_text("")
+        for e in (self.lengte_entry, self.breedte_entry, self.hoogte_entry, self.gewicht_entry,
+                  self.waarde_min_entry, self.waarde_max_entry, self.vraagprijs_entry):
+            e.set_text("")
+    
+    def _on_opslaan(self, widget):
+        titel = self.titel_entry.get_text().strip()
+        if not titel:
+            self._toon_fout("Titel is verplicht.")
             return
-        self.rotation_angle = int(self.rotation_scale.get_value())
-        self.rotation_label.set_text(f"{self.rotation_angle}°")
-        self.update_display()
-
-    def on_zoom_scale_changed(self, widget):
-        if not self.original_pixbuf:
+        if len(titel) > MAX_TITEL_LENGTE:
+            self._toon_fout(f"Titel mag maximaal {MAX_TITEL_LENGTE} tekens zijn.")
             return
-        self.zoom_level = int(self.zoom_scale.get_value())
-        self.zoom_label.set_text(f"{self.zoom_level}%")
-        self.update_display()
-
-    def zoom_in(self, widget):
-        if not self.original_pixbuf:
+        
+        opslaglocatie_naam = self.opslaglocatie_combo.get_active_text()
+        sublocatie_naam = self.sublocatie_combo.get_active_text()
+        rij_naam = self.rij_combo.get_active_text()
+        if not (opslaglocatie_naam and sublocatie_naam and rij_naam):
+            self._toon_fout("Kies een opslaglocatie, sublocatie en rij.")
             return
-        new_zoom = min(400, self.zoom_level + 10)
-        self.zoom_level = new_zoom
-        self.zoom_scale.set_value(new_zoom)
-        self.zoom_label.set_text(f"{new_zoom}%")
-        self.update_display()
-
-    def zoom_out(self, widget):
-        if not self.original_pixbuf:
-            return
-        new_zoom = max(10, self.zoom_level - 10)
-        self.zoom_level = new_zoom
-        self.zoom_scale.set_value(new_zoom)
-        self.zoom_label.set_text(f"{new_zoom}%")
-        self.update_display()
-
-    def zoom_fit(self, widget):
-        if not self.original_pixbuf:
-            return
-        allocation = self.event_box.get_allocation()
-        width = allocation.width - 20
-        height = allocation.height - 20
-
-        orig_width = self.original_pixbuf.get_width()
-        orig_height = self.original_pixbuf.get_height()
-
-        if width > 0 and height > 0:
-            scale_x = width / orig_width
-            scale_y = height / orig_height
-            scale = min(scale_x, scale_y) * 100
-            new_zoom = int(max(10, min(400, scale)))
-            self.zoom_level = new_zoom
-            self.zoom_scale.set_value(new_zoom)
-            self.zoom_label.set_text(f"{new_zoom}%")
-            self.update_display()
-
-    def zoom_100(self, widget):
-        if not self.original_pixbuf:
-            return
-        self.zoom_level = 100
-        self.zoom_scale.set_value(100)
-        self.zoom_label.set_text("100%")
-        self.update_display()
-
-    def update_display(self):
-        """Update de afbeelding met huidige zoom en rotatie (via PIL voor willekeurige hoeken)"""
-        if not self.original_pixbuf or not self.current_image_path:
-            return
-
+        
+        opslaglocatie_code = self.config.get("opslaglocatie_codes", {}).get(opslaglocatie_naam, "X")
+        sublocatie_code = self.config.get("sublocatie_codes", {}).get(sublocatie_naam, "X")
+        rij_code = self.config.get("rij_codes", {}).get(rij_naam, "X")
+        
+        buf = self.omschrijving_view.get_buffer()
+        omschrijving = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        
+        storage = get_backend(self.config)
+        
         try:
-            # Haal de originele afbeelding op
-            orig_width = self.original_pixbuf.get_width()
-            orig_height = self.original_pixbuf.get_height()
-
-            # Schaal eerst (via GdkPixbuf voor snelheid)
-            scale = self.zoom_level / 100.0
-            new_width = int(orig_width * scale)
-            new_height = int(orig_height * scale)
-
-            if new_width > 0 and new_height > 0:
-                scaled_pixbuf = self.original_pixbuf.scale_simple(
-                    new_width, new_height, GdkPixbuf.InterpType.BILINEAR
-                )
-            else:
-                scaled_pixbuf = self.original_pixbuf.copy()
-
-            # Als er rotatie nodig is, gebruik PIL voor willekeurige hoeken
-            if self.rotation_angle != 0:
-                # Converteer GdkPixbuf naar PIL Image
-                data = scaled_pixbuf.get_pixels()
-                pil_img = Image.frombytes('RGBA', (scaled_pixbuf.get_width(), scaled_pixbuf.get_height()), data)
-
-                # Roteer met PIL (ondersteunt willekeurige hoeken)
-                rotated_pil = pil_img.rotate(self.rotation_angle, expand=True, resample=Image.Resampling.BICUBIC)
-
-                # Sla de geroteerde afbeelding tijdelijk op en laad hem weer in GdkPixbuf
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                    rotated_pil.save(tmp.name, 'PNG')
-                    tmp_path = tmp.name
-
-                self.current_pixbuf = GdkPixbuf.Pixbuf.new_from_file(tmp_path)
-                os.unlink(tmp_path)  # Verwijder tijdelijk bestand
-            else:
-                self.current_pixbuf = scaled_pixbuf
-
-            self.image.set_from_pixbuf(self.current_pixbuf)
-
-        except Exception as e:
-            self.status_label.set_text(f"Fout: {e}")
-
-    def load_image(self, index):
-        if self.is_loading:
-            return
-
-        if 0 <= index < len(self.image_files):
-            self.is_loading = True
-            self.current_index = index
-            self.rotation_angle = 0
-            self.rotation_label.set_text("0°")
-            self.rotation_scale.set_value(0)
-
-            self.current_image_path = self.image_files[index]
-            if not os.path.exists(self.current_image_path):
-                self.status_label.set_text(f"Bestand niet gevonden: {self.current_image_path}")
-                self.is_loading = False
-                return
-
-            try:
-                if self.original_pixbuf:
-                    del self.original_pixbuf
-                if self.current_pixbuf:
-                    del self.current_pixbuf
-
-                self.original_pixbuf = GdkPixbuf.Pixbuf.new_from_file(self.current_image_path)
-
-                filename = os.path.basename(self.current_image_path)
-                size = f"{self.original_pixbuf.get_width()}x{self.original_pixbuf.get_height()}"
-                self.image_info_label.set_text(f"{filename}  |  {size}px")
-                self.status_label.set_text(f"Afbeelding {index + 1} van {len(self.image_files)}")
-                self.progress_label.set_text(f"{index + 1}/{len(self.image_files)}")
-
-                GLib.idle_add(self.zoom_fit, None)
-                gc.collect()
-
-            except Exception as e:
-                self.status_label.set_text(f"Fout bij laden: {e}")
-            finally:
-                self.is_loading = False
-
-    def rotate_image(self, degrees):
-        if not self.original_pixbuf:
-            return
-
-        new_angle = (self.rotation_angle + degrees) % 360
-        self.rotation_angle = new_angle
-        self.rotation_label.set_text(f"{new_angle}°")
-        self.rotation_scale.set_value(new_angle)
-
-        self.update_display()
-        self.status_label.set_text(f"Afbeelding geroteerd naar {new_angle}°")
-        self.save_rotation()
-
-    def save_rotation(self):
-        """Sla de geroteerde afbeelding op met behoud van originele resolutie"""
-        if not self.original_pixbuf or self.rotation_angle == 0 or not self.current_image_path:
-            return True
-
-        try:
-            # Gebruik PIL voor rotatie met originele resolutie
-            pil_img = Image.open(self.current_image_path)
-
-            # Roteer met PIL (behoud kwaliteit)
-            if self.rotation_angle != 0:
-                rotated_pil = pil_img.rotate(self.rotation_angle, expand=True, resample=Image.Resampling.BICUBIC)
-            else:
-                rotated_pil = pil_img
-
-            # Sla op als PNG (behoud transparantie)
-            rotated_pil.save(self.current_image_path, 'PNG')
-
-            # Herlaad de pixbuf
-            self.original_pixbuf = GdkPixbuf.Pixbuf.new_from_file(self.current_image_path)
-
-            self.update_display()
-            self.status_label.set_text(f"Rotatie opgeslagen: {self.rotation_angle}°")
-            return True
-        except Exception as e:
-            self.status_label.set_text(f"Fout bij opslaan: {e}")
-            return False
-
-    def rotate_left(self, widget):
-        self.rotate_image(-90)
-
-    def rotate_right(self, widget):
-        self.rotate_image(90)
-
-    def reset_rotation(self, widget):
-        self.rotation_angle = 0
-        self.rotation_label.set_text("0°")
-        self.rotation_scale.set_value(0)
-
-        try:
-            if self.current_image_path and os.path.exists(self.current_image_path):
-                self.original_pixbuf = GdkPixbuf.Pixbuf.new_from_file(self.current_image_path)
-                self.update_display()
-                self.status_label.set_text("Rotatie gereset")
-        except Exception as e:
-            self.status_label.set_text(f"Fout bij resetten: {e}")
-
-    def prev_image(self, widget):
-        if self.current_index > 0:
-            self.save_rotation()
-            self.load_image(self.current_index - 1)
-
-    def next_image(self, widget):
-        if self.current_index < len(self.image_files) - 1:
-            self.save_rotation()
-            self.load_image(self.current_index + 1)
-
-    def open_in_gimp(self, widget):
-        try:
-            self.save_rotation()
-            subprocess.Popen(["gimp", self.current_image_path],
-                           stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            self.status_label.set_text("Afbeelding geopend in GIMP")
-        except FileNotFoundError:
-            self.status_label.set_text("GIMP niet geïnstalleerd")
-
-    def refresh_current(self, widget):
-        self.load_image(self.current_index)
-
-    def cancel_processing(self, widget):
-        self.parent.cancel_processing()
-        self.destroy()
-
-    def continue_processing(self, widget):
-        if self.save_rotation():
-            if self.current_pixbuf:
-                del self.current_pixbuf
-            if self.original_pixbuf:
-                del self.original_pixbuf
-            gc.collect()
-            self.parent.process_after_inspection()
-            self.destroy()
-        else:
-            dialog = Gtk.MessageDialog(
-                parent=self,
-                flags=0,
-                message_type=Gtk.MessageType.WARNING,
-                buttons=Gtk.ButtonsType.YES_NO,
-                text="Rotatie opslaan mislukt!"
+            artikelnummer = generate_artikelnummer(
+                self.config, storage, opslaglocatie_code, sublocatie_code, rij_code
             )
-            dialog.format_secondary_text("Wil je doorgaan zonder de rotatie op te slaan?")
-            response = dialog.run()
-            dialog.destroy()
-
-            if response == Gtk.ResponseType.YES:
-                self.parent.process_after_inspection()
-                self.destroy()
-
-
-class CustomFileChooser(Gtk.Dialog):
-    """Eigen bestandskiezer met grote pictogrammen"""
-
-    def __init__(self, parent, title="Selecteer foto's", select_multiple=True):
-        super().__init__(title=title, parent=parent, flags=0)
-        self.set_default_size(950, 700)
-        self.set_modal(True)
-
-        self.selected_files = []
-        self.select_multiple = select_multiple
-        self.current_folder = os.path.expanduser("~/Afbeeldingen")
-        self.icon_store = None
-
-        self.add_buttons(
-            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-            Gtk.STOCK_OK, Gtk.ResponseType.OK
+        except Exception as e:
+            self._toon_fout(f"Kon artikelnummer niet genereren: {e}")
+            return
+        
+        product = {col: "" for col in COLUMNS}
+        product.update({
+            "artikelnummer": artikelnummer,
+            "titel": titel,
+            "categorie": self.categorie_combo.get_active_text() or "",
+            "omschrijving": omschrijving,
+            "lengte": self.lengte_entry.get_text().strip(),
+            "breedte": self.breedte_entry.get_text().strip(),
+            "hoogte": self.hoogte_entry.get_text().strip(),
+            "gewicht": self.gewicht_entry.get_text().strip(),
+            "conditie": self.conditie_combo.get_active_text() or "",
+            "staat_details": self._verzamel_staat_details(),
+            "waarde_min": self.waarde_min_entry.get_text().strip(),
+            "waarde_max": self.waarde_max_entry.get_text().strip(),
+            "vraagprijs": self.vraagprijs_entry.get_text().strip(),
+            "aanmaakdatum": datetime.date.today().isoformat(),
+            "tijdsperiode": self.tijdsperiode_combo.get_active_text() or "",
+            "opslaglocatie": opslaglocatie_naam,
+            "sublocatie": sublocatie_naam,
+            "rij": rij_naam,
+            "verkocht": "nee",
+            "online": "nee",
+            "algemene_voorwaarden": "",  # leeg = auto_marktplaats.py gebruikt de vaste tekst
+        })
+        
+        try:
+            folder, bestond_al = maak_product_map(self.config, product)
+            product["folder_locatie"] = folder
+        except Exception as e:
+            self._toon_fout(f"Kon productmap niet aanmaken: {e}")
+            return
+        
+        barcode_msg = ""
+        if self.barcode_check.get_active():
+            try:
+                barcode_path = genereer_barcode(artikelnummer, folder, self.config.get("barcode", {}))
+                barcode_msg = f"\n📊 Barcode opgeslagen: {barcode_path}"
+                printer_cfg = self.config.get("printer", {})
+                if printer_cfg.get("enabled"):
+                    print_barcode(barcode_path, printer_cfg)
+                    methode = printer_cfg.get("print_method", "cups")
+                    doel = printer_cfg.get("printer_name") if methode == "cups" else "Brother QL (USB)"
+                    barcode_msg += f"\n🖨️ Verstuurd naar printer '{doel}'"
+            except Exception as e:
+                barcode_msg = f"\n⚠️ Barcode-fout: {e}"
+        
+        try:
+            storage.add_product(product)
+        except Exception as e:
+            self._toon_fout(f"Kon niet opslaan naar opslag-backend: {e}")
+            return
+        
+        map_msg = "Bestaande map hergebruikt" if bestond_al else "Nieuwe map aangemaakt"
+        self.status_label.set_markup(
+            f"<span foreground='green'>✅ Product <b>{artikelnummer}</b> geregistreerd.\n"
+            f"📁 {map_msg}: {folder}{barcode_msg}</span>"
         )
+        self._reset_form()
+        self.main_window.overzicht_tab.herlaad()
+    
+    def _toon_fout(self, msg):
+        self.status_label.set_markup(f"<span foreground='red'>❌ {msg}</span>")
 
-        # Main container
-        vbox = self.get_content_area()
-        vbox.set_spacing(10)
 
-        # Top: pad invoer en blader knop
-        top_box = Gtk.Box(spacing=5)
-        vbox.pack_start(top_box, False, False, 0)
+# ============================================
+# TAB 2: OVERZICHT
+# ============================================
+OVERZICHT_KOLOMMEN = ["artikelnummer", "titel", "categorie", "conditie", "vraagprijs",
+                      "aanmaakdatum", "online", "advertentie_url", "verkocht", "verkoopprijs",
+                      "verkoopdatum", "leverwijze", "klant_naam"]
+OVERZICHT_LABELS = ["Artikelnummer", "Titel", "Categorie", "Conditie", "Vraagprijs",
+                    "Aanmaakdatum", "Online", "Advertentie-URL", "Verkocht", "Verkoopprijs",
+                    "Verkoopdatum", "Leverwijze", "Klant"]
 
-        self.path_entry = Gtk.Entry()
-        self.path_entry.set_placeholder_text("Pad naar map met foto's...")
-        self.path_entry.connect("activate", self.on_path_enter)
-        top_box.pack_start(self.path_entry, True, True, 0)
 
-        browse_btn = Gtk.Button(label="📂 Bladeren")
-        browse_btn.connect("clicked", self.browse_folder)
-        top_box.pack_start(browse_btn, False, False, 0)
-
-        refresh_btn = Gtk.Button(label="🔄 Vernieuw")
-        refresh_btn.connect("clicked", self.refresh_current_folder)
-        top_box.pack_start(refresh_btn, False, False, 0)
-
-        # Huidige map label
-        self.folder_label = Gtk.Label()
-        self.folder_label.set_markup("<i>Selecteer een map met de 'Bladeren' knop</i>")
-        self.folder_label.set_xalign(0)
-        vbox.pack_start(self.folder_label, False, False, 0)
-
-        # IconView met grote pictogrammen
+class OverzichtTab(Gtk.Box):
+    def __init__(self, main_window):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.main_window = main_window
+        self.config = main_window.config
+        self.set_border_width(15)
+        
+        # Filter-knoppen
+        filter_row = Gtk.Box(spacing=5)
+        self.filter_alles_btn = Gtk.RadioButton.new_with_label_from_widget(None, "Alles")
+        self.filter_offline_btn = Gtk.RadioButton.new_with_label_from_widget(self.filter_alles_btn, "Offline")
+        self.filter_online_btn = Gtk.RadioButton.new_with_label_from_widget(self.filter_alles_btn, "Online")
+        self.filter_verkocht_btn = Gtk.RadioButton.new_with_label_from_widget(self.filter_alles_btn, "Verkocht")
+        self.filter_offline_btn.set_active(True)
+        for btn in (self.filter_alles_btn, self.filter_offline_btn, self.filter_online_btn, self.filter_verkocht_btn):
+            btn.connect("toggled", lambda w: self.herlaad())
+            filter_row.pack_start(btn, False, False, 0)
+        
+        refresh_btn = Gtk.Button(label="🔄 Vernieuwen")
+        refresh_btn.connect("clicked", lambda w: self.herlaad())
+        filter_row.pack_start(refresh_btn, False, False, 10)
+        
+        self.pack_start(filter_row, False, False, 0)
+        
+        # Tabel
+        self.store = Gtk.ListStore(*([str] * len(OVERZICHT_KOLOMMEN)))
+        self.tree_view = Gtk.TreeView(model=self.store)
+        self.tree_view.set_search_column(0)
+        
+        for i, label in enumerate(OVERZICHT_LABELS):
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(label, renderer, text=i)
+            column.set_sort_column_id(i)
+            column.set_resizable(True)
+            self.tree_view.append_column(column)
+        
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scrolled.set_size_request(-1, 450)
-        vbox.pack_start(scrolled, True, True, 0)
-
-        # ListStore voor IconView: (pictogram, bestandsnaam, volledig_pad)
-        self.icon_store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, str)
-        self.icon_view = Gtk.IconView()
-        self.icon_view.set_model(self.icon_store)
-        self.icon_view.set_pixbuf_column(0)
-        self.icon_view.set_text_column(1)
-        self.icon_view.set_item_width(140)
-        self.icon_view.set_columns(0)
-        self.icon_view.set_selection_mode(Gtk.SelectionMode.MULTIPLE if select_multiple else Gtk.SelectionMode.SINGLE)
-        self.icon_view.set_activate_on_single_click(False)
-        self.icon_view.connect("item-activated", self.on_item_activated)
-        scrolled.add(self.icon_view)
-
-        # Selectie info
-        info_box = Gtk.Box(spacing=20)
-        vbox.pack_start(info_box, False, False, 5)
-
-        self.selected_label = Gtk.Label()
-        self.selected_label.set_markup("<small>0 bestanden geselecteerd</small>")
-        info_box.pack_start(self.selected_label, True, True, 0)
-
-        if select_multiple:
-            select_all_btn = Gtk.Button(label="Alles selecteren")
-            select_all_btn.connect("clicked", self.select_all)
-            info_box.pack_start(select_all_btn, False, False, 0)
-
-            deselect_all_btn = Gtk.Button(label="Alles deselecteren")
-            deselect_all_btn.connect("clicked", self.deselect_all)
-            info_box.pack_start(deselect_all_btn, False, False, 0)
-
-        # Verbind selectie verandering
-        self.icon_view.connect("selection-changed", self.on_selection_changed)
-
-        # Laad standaard map
-        self.load_folder(self.current_folder)
-        self.show_all()
-
-    def load_folder(self, folder_path):
-        """Laad afbeeldingen uit een map in de IconView"""
-        self.icon_store.clear()
-        self.selected_files = []
-        self.selected_label.set_markup("<small>0 bestanden geselecteerd</small>")
-
-        if not os.path.exists(folder_path):
-            self.folder_label.set_markup(f"<span color='red'>Map bestaat niet: {folder_path}</span>")
-            return
-
-        self.current_folder = folder_path
-        self.folder_label.set_markup(f"<b>{folder_path}</b>")
-        self.path_entry.set_text(folder_path)
-
-        image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.tif']
-        count = 0
-
+        scrolled.add(self.tree_view)
+        self.pack_start(scrolled, True, True, 0)
+        
+        # Actie-knoppen
+        actie_row = Gtk.Box(spacing=5)
+        self.bewerk_btn = Gtk.Button(label="✏️ Bewerken")
+        self.bewerk_btn.connect("clicked", self._on_bewerken)
+        actie_row.pack_start(self.bewerk_btn, False, False, 0)
+        
+        self.verwijder_btn = Gtk.Button(label="🗑️ Verwijderen")
+        self.verwijder_btn.connect("clicked", self._on_verwijderen)
+        actie_row.pack_start(self.verwijder_btn, False, False, 0)
+        
+        self.online_btn = Gtk.Button(label="🌐 Markeer als online")
+        self.online_btn.connect("clicked", self._on_markeer_online)
+        actie_row.pack_start(self.online_btn, False, False, 0)
+        
+        self.verkocht_btn = Gtk.Button(label="💰 Markeer als verkocht")
+        self.verkocht_btn.connect("clicked", self._on_markeer_verkocht)
+        actie_row.pack_start(self.verkocht_btn, False, False, 0)
+        
+        self.pack_start(actie_row, False, False, 0)
+        
+        self.omzet_label = Gtk.Label()
+        self.omzet_label.set_xalign(0)
+        self.pack_start(self.omzet_label, False, False, 0)
+        
+        self.herlaad()
+    
+    def _huidige_producten(self):
+        storage = get_backend(self.config)
         try:
-            for file in sorted(os.listdir(folder_path)):
-                file_path = os.path.join(folder_path, file)
-                if os.path.isfile(file_path):
-                    ext = os.path.splitext(file)[1].lower()
-                    if ext in image_extensions:
-                        try:
-                            pil_img = Image.open(file_path)
-                            pil_img.thumbnail((120, 120), Image.Resampling.LANCZOS)
-
-                            img_bytes = io.BytesIO()
-
-                            if pil_img.mode in ('RGBA', 'LA', 'P'):
-                                if pil_img.mode == 'P':
-                                    pil_img = pil_img.convert('RGBA')
-                                pil_img.save(img_bytes, format='PNG')
-                            else:
-                                pil_img = pil_img.convert('RGB')
-                                pil_img.save(img_bytes, format='JPEG')
-
-                            img_bytes.seek(0)
-
-                            loader = GdkPixbuf.PixbufLoader.new()
-                            loader.write(img_bytes.getvalue())
-                            loader.close()
-                            pixbuf = loader.get_pixbuf()
-
-                            self.icon_store.append([pixbuf, file, file_path])
-                            count += 1
-                        except Exception as e:
-                            print(f"Fout bij laden {file}: {e}")
-                            try:
-                                pixbuf = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 80, 80)
-                                pixbuf.fill(0x88888888)
-                                self.icon_store.append([pixbuf, file, file_path])
-                                count += 1
-                            except:
-                                pass
+            return storage.load_products()
         except Exception as e:
-            self.folder_label.set_markup(f"<span color='red'>Fout bij lezen map: {e}</span>")
-
-        self.folder_label.set_markup(f"<b>{folder_path}</b>  <small>({count} afbeeldingen)</small>")
-
-    def browse_folder(self, widget):
-        dialog = Gtk.FileChooserDialog(
-            title="Selecteer map met foto's",
-            parent=self,
-            action=Gtk.FileChooserAction.SELECT_FOLDER,
-            buttons=(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-                     Gtk.STOCK_OK, Gtk.ResponseType.OK)
+            self._toon_foutdialoog(f"Kon producten niet laden: {e}")
+            return []
+    
+    def herlaad(self):
+        self.store.clear()
+        producten = self._huidige_producten()
+        
+        if self.filter_offline_btn.get_active():
+            producten = [p for p in producten
+                         if p.get("verkocht", "nee").lower() != "ja"
+                         and p.get("online", "nee").lower() != "ja"]
+        elif self.filter_online_btn.get_active():
+            producten = [p for p in producten
+                         if p.get("verkocht", "nee").lower() != "ja"
+                         and p.get("online", "nee").lower() == "ja"]
+        elif self.filter_verkocht_btn.get_active():
+            producten = [p for p in producten if p.get("verkocht", "nee").lower() == "ja"]
+        
+        for p in producten:
+            row = [p.get(col, "") for col in OVERZICHT_KOLOMMEN]
+            self.store.append(row)
+        
+        if self.filter_verkocht_btn.get_active():
+            totaal = 0.0
+            for p in producten:
+                try:
+                    prijs = p.get("verkoopprijs", "").replace("€", "").replace(",", ".").strip()
+                    totaal += float(prijs) if prijs else 0.0
+                except ValueError:
+                    pass
+            self.omzet_label.set_markup(
+                f"<b>Totale omzet (verkocht, {len(producten)} items): €{totaal:.2f}</b>\n"
+                f"<small><i>Let op: er wordt geen inkoopprijs bijgehouden (kringloop-donaties), "
+                f"dus omzet = winst in dit overzicht.</i></small>"
+            )
+        else:
+            self.omzet_label.set_text("")
+    
+    def _geselecteerd_artikelnummer(self):
+        selection = self.tree_view.get_selection()
+        model, treeiter = selection.get_selected()
+        if treeiter is None:
+            return None
+        return model[treeiter][0]
+    
+    def _toon_foutdialoog(self, msg):
+        dialog = Gtk.MessageDialog(
+            transient_for=self.main_window, flags=0,
+            message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.OK, text=msg
         )
-        dialog.set_current_folder(self.current_folder)
-
-        if dialog.run() == Gtk.ResponseType.OK:
-            folder_path = dialog.get_filename()
-            self.load_folder(folder_path)
+        dialog.run()
         dialog.destroy()
+    
+    def _on_bewerken(self, widget):
+        artikelnummer = self._geselecteerd_artikelnummer()
+        if not artikelnummer:
+            self._toon_foutdialoog("Selecteer eerst een product.")
+            return
+        
+        storage = get_backend(self.config)
+        producten = storage.load_products()
+        product = next((p for p in producten if p.get("artikelnummer") == artikelnummer), None)
+        if not product:
+            self._toon_foutdialoog("Product niet gevonden.")
+            return
+        
+        dialog = BewerkDialog(self.main_window, product)
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            bijgewerkt = dialog.get_product()
+            try:
+                storage.update_product(artikelnummer, bijgewerkt)
+                self.herlaad()
+            except Exception as e:
+                self._toon_foutdialoog(f"Kon niet opslaan: {e}")
+        dialog.destroy()
+    
+    def _on_verwijderen(self, widget):
+        artikelnummer = self._geselecteerd_artikelnummer()
+        if not artikelnummer:
+            self._toon_foutdialoog("Selecteer eerst een product.")
+            return
+        
+        storage = get_backend(self.config)
+        producten = storage.load_products()
+        product = next((p for p in producten if p.get("artikelnummer") == artikelnummer), None)
+        folder = product.get("folder_locatie", "").strip() if product else ""
+        folder_bestaat = bool(folder) and os.path.isdir(folder)
+        
+        confirm = Gtk.MessageDialog(
+            transient_for=self.main_window, flags=0,
+            message_type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.YES_NO,
+            text=f"Product {artikelnummer} verwijderen uit de opslag?"
+        )
+        if folder_bestaat:
+            confirm.format_secondary_text(f"De productmap wordt naar de prullenbak verplaatst:\n{folder}")
+        else:
+            confirm.format_secondary_text("Geen (bestaande) productmap gevonden om te verplaatsen.")
+        response = confirm.run()
+        confirm.destroy()
+        
+        if response == Gtk.ResponseType.YES:
+            try:
+                storage.delete_product(artikelnummer)
+            except Exception as e:
+                self._toon_foutdialoog(f"Kon niet verwijderen: {e}")
+                return
+            
+            if folder_bestaat:
+                try:
+                    from send2trash import send2trash
+                    send2trash(folder)
+                except ImportError:
+                    self._toon_foutdialoog(
+                        "Product is verwijderd uit de opslag, maar send2trash is niet "
+                        "geïnstalleerd - de map is blijven staan. Installeer met:\n"
+                        "pip install Send2Trash --break-system-packages"
+                    )
+                except Exception as e:
+                    self._toon_foutdialoog(
+                        f"Product is verwijderd uit de opslag, maar de map kon niet naar "
+                        f"de prullenbak worden verplaatst: {e}"
+                    )
+            
+            self.herlaad()
+    
+    def _on_markeer_online(self, widget):
+        artikelnummer = self._geselecteerd_artikelnummer()
+        if not artikelnummer:
+            self._toon_foutdialoog("Selecteer eerst een product.")
+            return
+        
+        dialog = Gtk.Dialog(title="Markeer als online", transient_for=self.main_window, flags=0)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(10)
+        
+        box.pack_start(Gtk.Label(label=f"Advertentie-URL voor {artikelnummer} (optioneel):"), False, False, 0)
+        url_entry = Gtk.Entry()
+        url_entry.set_placeholder_text("https://www.marktplaats.nl/v/...")
+        box.pack_start(url_entry, False, False, 0)
+        
+        dialog.show_all()
+        response = dialog.run()
+        url = url_entry.get_text().strip()
+        dialog.destroy()
+        
+        if response == Gtk.ResponseType.OK:
+            storage = get_backend(self.config)
+            producten = storage.load_products()
+            product = next((p for p in producten if p.get("artikelnummer") == artikelnummer), None)
+            if not product:
+                self._toon_foutdialoog("Product niet gevonden.")
+                return
+            product["online"] = "ja"
+            if url:
+                product["advertentie_url"] = url
+            try:
+                storage.update_product(artikelnummer, product)
+                self.herlaad()
+            except Exception as e:
+                self._toon_foutdialoog(f"Kon niet opslaan: {e}")
+    
+    def _on_markeer_verkocht(self, widget):
+        artikelnummer = self._geselecteerd_artikelnummer()
+        if not artikelnummer:
+            self._toon_foutdialoog("Selecteer eerst een product.")
+            return
+        
+        dialog = VerkochtDialog(self.main_window, artikelnummer)
+        response = dialog.run()
+        gegevens = dialog.get_gegevens() if response == Gtk.ResponseType.OK else None
+        dialog.destroy()
+        
+        if gegevens is None:
+            return
+        
+        if not gegevens["verkoopprijs"]:
+            self._toon_foutdialoog("Vul een verkoopprijs in.")
+            return
+        
+        storage = get_backend(self.config)
+        producten = storage.load_products()
+        product = next((p for p in producten if p.get("artikelnummer") == artikelnummer), None)
+        if not product:
+            self._toon_foutdialoog("Product niet gevonden.")
+            return
+        
+        product["verkocht"] = "ja"
+        product.update(gegevens)
+        try:
+            storage.update_product(artikelnummer, product)
+            self.herlaad()
+        except Exception as e:
+            self._toon_foutdialoog(f"Kon niet opslaan: {e}")
 
-    def refresh_current_folder(self, widget):
-        self.load_folder(self.current_folder)
 
-    def on_path_enter(self, widget):
-        folder_path = self.path_entry.get_text().strip()
-        if folder_path and os.path.exists(folder_path):
-            self.load_folder(folder_path)
+class VerkochtDialog(Gtk.Dialog):
+    """Dialoog voor het markeren als verkocht: eerst kiezen tussen Ophalen
+    en Verzenden, met bijbehorende klantgegevens."""
+    def __init__(self, parent, artikelnummer):
+        super().__init__(title=f"Markeer als verkocht - {artikelnummer}", transient_for=parent, flags=0)
+        self.set_default_size(420, 380)
+        self.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        
+        box = self.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        
+        box.pack_start(Gtk.Label(label=f"Verkoopprijs voor {artikelnummer}:", xalign=0), False, False, 0)
+        self.prijs_entry = Gtk.Entry()
+        self.prijs_entry.set_placeholder_text("bijv. 45.00")
+        box.pack_start(self.prijs_entry, False, False, 0)
+        
+        vandaag = datetime.date.today().isoformat()
+        box.pack_start(Gtk.Label(label=f"Verkoopdatum: {vandaag} (automatisch)", xalign=0), False, False, 0)
+        self.vandaag = vandaag
+        
+        box.pack_start(Gtk.Separator(), False, False, 6)
+        
+        box.pack_start(self._bold_label("Leverwijze"), False, False, 0)
+        lever_row = Gtk.Box(spacing=10)
+        self.ophalen_btn = Gtk.RadioButton.new_with_label_from_widget(None, "Ophalen")
+        self.verzenden_btn = Gtk.RadioButton.new_with_label_from_widget(self.ophalen_btn, "Verzenden")
+        self.ophalen_btn.connect("toggled", self._on_leverwijze_changed)
+        lever_row.pack_start(self.ophalen_btn, False, False, 0)
+        lever_row.pack_start(self.verzenden_btn, False, False, 0)
+        box.pack_start(lever_row, False, False, 0)
+        
+        box.pack_start(Gtk.Label(label="Marktplaatsnaam koper:", xalign=0), False, False, 0)
+        self.klant_naam_entry = Gtk.Entry()
+        box.pack_start(self.klant_naam_entry, False, False, 0)
+        
+        # --- Ophalen-specifieke velden ---
+        self.ophalen_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.pack_start(self.ophalen_box, False, False, 0)
+        
+        self.ophalen_box.pack_start(Gtk.Label(label="Telefoonnummer:", xalign=0), False, False, 0)
+        self.telefoon_entry = Gtk.Entry()
+        self.ophalen_box.pack_start(self.telefoon_entry, False, False, 0)
+        
+        self.ophalen_box.pack_start(Gtk.Label(label="E-mail:", xalign=0), False, False, 0)
+        self.email_entry = Gtk.Entry()
+        self.ophalen_box.pack_start(self.email_entry, False, False, 0)
+        
+        self.ophalen_box.pack_start(Gtk.Label(label="Afspraak (datum/tijd ophalen):", xalign=0), False, False, 0)
+        self.afspraak_entry = Gtk.Entry()
+        self.afspraak_entry.set_placeholder_text("bijv. zaterdag 14:00")
+        self.ophalen_box.pack_start(self.afspraak_entry, False, False, 0)
+        
+        # --- Verzenden-specifieke velden ---
+        self.verzenden_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.pack_start(self.verzenden_box, False, False, 0)
+        
+        self.verzenden_box.pack_start(Gtk.Label(label="Track & Trace-nummer (optioneel):", xalign=0), False, False, 0)
+        self.track_trace_entry = Gtk.Entry()
+        self.verzenden_box.pack_start(self.track_trace_entry, False, False, 0)
+        
+        self.ophalen_btn.set_active(True)
+        self._on_leverwijze_changed(self.ophalen_btn)
+        
+        self.show_all()
+    
+    def _bold_label(self, text):
+        label = Gtk.Label()
+        label.set_markup(f"<b>{text}</b>")
+        label.set_xalign(0)
+        return label
+    
+    def _on_leverwijze_changed(self, widget):
+        is_ophalen = self.ophalen_btn.get_active()
+        self.ophalen_box.set_visible(is_ophalen)
+        self.verzenden_box.set_visible(not is_ophalen)
+    
+    def get_gegevens(self):
+        leverwijze = "ophalen" if self.ophalen_btn.get_active() else "verzenden"
+        gegevens = {
+            "verkoopprijs": self.prijs_entry.get_text().strip(),
+            "verkoopdatum": self.vandaag,
+            "leverwijze": leverwijze,
+            "klant_naam": self.klant_naam_entry.get_text().strip(),
+        }
+        if leverwijze == "ophalen":
+            gegevens["klant_telefoon"] = self.telefoon_entry.get_text().strip()
+            gegevens["klant_email"] = self.email_entry.get_text().strip()
+            gegevens["ophaal_afspraak"] = self.afspraak_entry.get_text().strip()
+            gegevens["track_trace"] = ""
+        else:
+            gegevens["klant_telefoon"] = ""
+            gegevens["klant_email"] = ""
+            gegevens["ophaal_afspraak"] = ""
+            gegevens["track_trace"] = self.track_trace_entry.get_text().strip()
+        return gegevens
 
-    def on_item_activated(self, icon_view, path):
-        model = icon_view.get_model()
-        iter_ = model.get_iter(path)
-        file_path = model.get_value(iter_, 2)
 
-        if os.path.isdir(file_path):
-            self.load_folder(file_path)
+class BewerkDialog(Gtk.Dialog):
+    """Dialoog om alle velden van een product te bewerken."""
+    def __init__(self, parent, product):
+        super().__init__(title=f"Bewerken - {product.get('artikelnummer', '')}", transient_for=parent, flags=0)
+        self.product = dict(product)
+        self.set_default_size(500, 600)
+        self.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        
+        box = self.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(10)
+        
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        box.pack_start(scrolled, True, True, 0)
+        
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        inner.set_border_width(5)
+        scrolled.add(inner)
+        
+        self.entries = {}
+        # artikelnummer niet bewerkbaar (is de sleutel)
+        inner.pack_start(Gtk.Label(label=f"Artikelnummer: {self.product.get('artikelnummer', '')}"), False, False, 0)
+        
+        bewerkbare_velden = [c for c in COLUMNS if c not in ("artikelnummer", "folder_locatie")]
+        for veld in bewerkbare_velden:
+            label = Gtk.Label(label=veld)
+            label.set_xalign(0)
+            inner.pack_start(label, False, False, 0)
+            if veld in ("omschrijving", "algemene_voorwaarden"):
+                view = Gtk.TextView()
+                view.get_buffer().set_text(self.product.get(veld, ""))
+                view_scroll = Gtk.ScrolledWindow()
+                view_scroll.set_size_request(-1, 80)
+                view_scroll.add(view)
+                inner.pack_start(view_scroll, False, False, 0)
+                self.entries[veld] = view
+            else:
+                entry = Gtk.Entry()
+                entry.set_text(self.product.get(veld, ""))
+                inner.pack_start(entry, False, False, 0)
+                self.entries[veld] = entry
+        
+        self.show_all()
+    
+    def get_product(self):
+        result = dict(self.product)
+        for veld, widget in self.entries.items():
+            if isinstance(widget, Gtk.TextView):
+                buf = widget.get_buffer()
+                result[veld] = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+            else:
+                result[veld] = widget.get_text()
+        return result
 
-    def on_selection_changed(self, icon_view):
-        self.selected_files = []
 
-        model = icon_view.get_model()
-        iter_ = model.get_iter_first()
-
-        while iter_:
-            path = model.get_path(iter_)
-            if icon_view.path_is_selected(path):
-                file_path = model.get_value(iter_, 2)
-                if os.path.isfile(file_path):
-                    self.selected_files.append(file_path)
-            iter_ = model.iter_next(iter_)
-
-        self.selected_label.set_markup(f"<small><b>{len(self.selected_files)}</b> bestanden geselecteerd</small>")
-
-    def select_all(self, widget):
-        model = self.icon_view.get_model()
-        iter_ = model.get_iter_first()
-        while iter_:
-            path = model.get_path(iter_)
-            self.icon_view.select_path(path)
-            iter_ = model.iter_next(iter_)
-
-    def deselect_all(self, widget):
-        self.icon_view.unselect_all()
-
-    def get_filenames(self):
-        return self.selected_files
-
-
-class MarktplaatsApp(Gtk.Window):
+# ============================================
+# HOOFDVENSTER
+# ============================================
+class MainWindow(Gtk.Window):
     def __init__(self):
-        super().__init__(title="Marktplaats Foto Manager")
-
-        # Kleiner en beter schaalbaar venster
-        self.set_default_size(900, 650)
-        self.set_border_width(15)
+        super().__init__(title="Marktplaats Product Manager")
+        self.set_default_size(700, 800)
         self.set_position(Gtk.WindowPosition.CENTER)
-        self.set_resizable(True)  # Zorg dat het venster geresized kan worden
-
-        # Set application icon
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+        
+        icon_path = os.path.join(config_dir(), "icon.png")
         if os.path.exists(icon_path):
             try:
                 self.set_icon_from_file(icon_path)
             except Exception:
                 pass
-
-        self.config = {
-            'source_dir': '',
-            'source_files': [],
-            'source_type': 'map',
-            'output_dir': '',
-            'watermark_path': '',
-            'logo_path': '',
-            'background_type': 'white',
-            'background_color': '#ffffff',
-            'background_image': '',
-            'auto_rotate': True,
-            'color_enhance': True,
-            'bg_removal_tool': 'transparent-background'
-        }
-
-        self.transparent_pngs = []
-        self.log_queue = Queue()
-        self.stop_flag = False
-
-        self.setup_ui()
-        self.load_config()
-        GLib.timeout_add(100, self.process_log_queue)
-
-    def setup_ui(self):
-        main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
-        self.add(main_vbox)
-
-        title = Gtk.Label()
-        title.set_markup("<span size='x-large' weight='bold'>Marktplaats Foto Manager</span>")
-        main_vbox.pack_start(title, False, False, 0)
-
-        notebook = Gtk.Notebook()
-        main_vbox.pack_start(notebook, True, True, 0)
-
-        settings_page = self.create_settings_page()
-        notebook.append_page(settings_page, Gtk.Label(label="Instellingen"))
-
-        processing_page = self.create_processing_page()
-        notebook.append_page(processing_page, Gtk.Label(label="Verwerking"))
-
-        log_page = self.create_log_page()
-        notebook.append_page(log_page, Gtk.Label(label="Logboek"))
-
-        self.statusbar = Gtk.Statusbar()
-        main_vbox.pack_start(self.statusbar, False, False, 0)
-        self.status_context = self.statusbar.get_context_id("status")
-
-    def create_settings_page(self):
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        page.set_border_width(10)
-
-        # Maak een scrollbare container zodat alles past
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        scrolled.set_shadow_type(Gtk.ShadowType.IN)
-        page.pack_start(scrolled, True, True, 0)
-
-        # De inhoud komt in de scrollbare container
-        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        content_box.set_border_width(5)
-        scrolled.add(content_box)
-
-        locations_frame = Gtk.Frame(label="Bestandslocaties")
-        locations_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        locations_frame.add(locations_box)
-        content_box.pack_start(locations_frame, False, False, 0)
-
-        # ===== BRON SELECTIE =====
-        source_frame = Gtk.Frame(label="Bronbestanden")
-        source_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        source_frame.add(source_box)
-        locations_box.pack_start(source_frame, False, False, 5)
-
-        # Radio buttons voor bron type
-        radio_box = Gtk.Box(spacing=20)
-        source_box.pack_start(radio_box, False, False, 5)
-
-        self.source_type_map = Gtk.RadioButton.new_with_label(None, "📁 Bronmap")
-        self.source_type_map.connect("toggled", self.on_source_type_changed, "map")
-        radio_box.pack_start(self.source_type_map, False, False, 0)
-
-        self.source_type_files = Gtk.RadioButton.new_with_label_from_widget(self.source_type_map, "📄 Losse bestanden")
-        self.source_type_files.connect("toggled", self.on_source_type_changed, "files")
-        radio_box.pack_start(self.source_type_files, False, False, 0)
-
-        # Bronmap selector
-        map_box = Gtk.Box(spacing=10)
-        source_box.pack_start(map_box, False, False, 5)
-
-        map_label = Gtk.Label(label="Bronmap (foto's):")
-        map_label.set_size_request(120, -1)
-        self.src_entry = Gtk.Entry()
-        self.src_entry.connect("changed", self.on_src_changed)
-        src_btn = Gtk.Button(label="Bladeren")
-        src_btn.connect("clicked", self.browse_source)
-        map_box.pack_start(map_label, False, False, 0)
-        map_box.pack_start(self.src_entry, True, True, 0)
-        map_box.pack_start(src_btn, False, False, 0)
-
-        # Losse bestanden selector
-        files_box = Gtk.Box(spacing=10)
-        source_box.pack_start(files_box, False, False, 5)
-
-        files_label = Gtk.Label(label="Bestanden:")
-        files_label.set_size_request(120, -1)
-        files_box.pack_start(files_label, False, False, 0)
-
-        files_btn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-        add_files_btn = Gtk.Button(label="➕ Bestanden toevoegen (grote pictogrammen)")
-        add_files_btn.connect("clicked", self.browse_files_with_icons)
-        files_btn_box.pack_start(add_files_btn, False, False, 0)
-
-        files_box.pack_start(files_btn_box, False, False, 0)
-
-        # Lijst van geselecteerde bestanden
-        list_frame = Gtk.Frame(label="Geselecteerde bestanden")
-        list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        list_frame.add(list_box)
-        source_box.pack_start(list_frame, True, True, 5)
-
-        self.files_list = Gtk.ListStore(str, str)
-        self.files_treeview = Gtk.TreeView(model=self.files_list)
-        self.files_treeview.set_headers_visible(True)
-        self.files_treeview.set_size_request(-1, 80)
-
-        renderer_text = Gtk.CellRendererText()
-        column = Gtk.TreeViewColumn("Bestandsnaam", renderer_text, text=0)
-        self.files_treeview.append_column(column)
-
-        column2 = Gtk.TreeViewColumn("Pad", renderer_text, text=1)
-        self.files_treeview.append_column(column2)
-
-        files_scroll = Gtk.ScrolledWindow()
-        files_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        files_scroll.set_size_request(-1, 60)
-        files_scroll.add(self.files_treeview)
-        list_box.pack_start(files_scroll, True, True, 0)
-
-        list_btn_box = Gtk.Box(spacing=5)
-        list_box.pack_start(list_btn_box, False, False, 0)
-
-        remove_file_btn = Gtk.Button(label="➖ Verwijder geselecteerd")
-        remove_file_btn.connect("clicked", self.remove_selected_file)
-        list_btn_box.pack_start(remove_file_btn, False, False, 0)
-
-        clear_files_btn = Gtk.Button(label="🗑️ Lijst leegmaken")
-        clear_files_btn.connect("clicked", self.clear_file_list)
-        list_btn_box.pack_start(clear_files_btn, False, False, 0)
-
-        self.files_count_label = Gtk.Label()
-        self.files_count_label.set_markup("<small>0 bestanden geselecteerd</small>")
-        source_box.pack_start(self.files_count_label, False, False, 5)
-
-        # ===== UITVOERMAP =====
-        out_box = Gtk.Box(spacing=10)
-        out_label = Gtk.Label(label="Uitvoermap:")
-        out_label.set_size_request(120, -1)
-        self.out_entry = Gtk.Entry()
-        self.out_entry.connect("changed", self.on_out_changed)
-        out_btn = Gtk.Button(label="Bladeren")
-        out_btn.connect("clicked", self.browse_output)
-        out_box.pack_start(out_label, False, False, 0)
-        out_box.pack_start(self.out_entry, True, True, 0)
-        out_box.pack_start(out_btn, False, False, 0)
-        locations_box.pack_start(out_box, False, False, 5)
-
-        # ===== WATERMERK =====
-        wm_box = Gtk.Box(spacing=10)
-        wm_label = Gtk.Label(label="Watermerk bestand:")
-        wm_label.set_size_request(120, -1)
-        self.wm_entry = Gtk.Entry()
-        self.wm_entry.connect("changed", self.on_wm_changed)
-        wm_btn = Gtk.Button(label="Bladeren")
-        wm_btn.connect("clicked", self.browse_watermark)
-        wm_box.pack_start(wm_label, False, False, 0)
-        wm_box.pack_start(self.wm_entry, True, True, 0)
-        wm_box.pack_start(wm_btn, False, False, 0)
-        locations_box.pack_start(wm_box, False, False, 5)
-
-        # ===== LOGO =====
-        logo_box = Gtk.Box(spacing=10)
-        logo_label = Gtk.Label(label="Logo bestand:")
-        logo_label.set_size_request(120, -1)
-        self.logo_entry = Gtk.Entry()
-        self.logo_entry.connect("changed", self.on_logo_changed)
-        logo_btn = Gtk.Button(label="Bladeren")
-        logo_btn.connect("clicked", self.browse_logo)
-        logo_box.pack_start(logo_label, False, False, 0)
-        logo_box.pack_start(self.logo_entry, True, True, 0)
-        logo_box.pack_start(logo_btn, False, False, 0)
-        locations_box.pack_start(logo_box, False, False, 5)
-
-        # ===== ACHTERGROND INSTELLINGEN =====
-        bg_frame = Gtk.Frame(label="Achtergrond instellingen (na inspectie)")
-        bg_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        bg_frame.add(bg_box)
-        locations_box.pack_start(bg_frame, False, False, 8)
-
-        type_box = Gtk.Box(spacing=10)
-        type_label = Gtk.Label(label="Achtergrond type:")
-        type_label.set_size_request(120, -1)
-        self.bg_type_combo = Gtk.ComboBoxText()
-        self.bg_type_combo.append_text("Wit (standaard)")
-        self.bg_type_combo.append_text("Kleur")
-        self.bg_type_combo.append_text("Afbeelding")
-        self.bg_type_combo.append_text("Originele achtergrond behouden")
-        self.bg_type_combo.set_active(0)
-        self.bg_type_combo.connect("changed", self.on_background_type_changed)
-        type_box.pack_start(type_label, False, False, 0)
-        type_box.pack_start(self.bg_type_combo, False, False, 0)
-        bg_box.pack_start(type_box, False, False, 0)
-
-        color_box = Gtk.Box(spacing=10)
-        color_label = Gtk.Label(label="Kleurcode (HEX):")
-        color_label.set_size_request(120, -1)
-        self.bg_color_entry = Gtk.Entry()
-        self.bg_color_entry.set_text("#ffffff")
-        self.bg_color_entry.set_sensitive(False)
-        color_box.pack_start(color_label, False, False, 0)
-        color_box.pack_start(self.bg_color_entry, True, True, 0)
-        bg_box.pack_start(color_box, False, False, 0)
-
-        img_box = Gtk.Box(spacing=10)
-        img_label = Gtk.Label(label="Achtergrond afbeelding:")
-        img_label.set_size_request(120, -1)
-        self.bg_image_entry = Gtk.Entry()
-        self.bg_image_entry.set_sensitive(False)
-        img_btn = Gtk.Button(label="Bladeren")
-        img_btn.connect("clicked", self.browse_background_image)
-        img_box.pack_start(img_label, False, False, 0)
-        img_box.pack_start(self.bg_image_entry, True, True, 0)
-        img_box.pack_start(img_btn, False, False, 0)
-        bg_box.pack_start(img_box, False, False, 0)
-
-        info_label = Gtk.Label()
-        info_label.set_markup("<small>Tip: HEX code zoals #ff0000 (rood) of selecteer een afbeelding</small>")
-        bg_box.pack_start(info_label, False, False, 0)
-
-        # ===== TOOL SELECTIE =====
-        tool_frame = Gtk.Frame(label="Achtergrond Verwijdering Tool")
-        tool_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        tool_frame.add(tool_box)
-        locations_box.pack_start(tool_frame, False, False, 8)
-
-        tool_info = Gtk.Label()
-        tool_info.set_markup("<small>Kies welke tool je wilt gebruiken voor het verwijderen van de achtergrond</small>")
-        tool_box.pack_start(tool_info, False, False, 0)
-
-        tool_radio_box = Gtk.Box(spacing=15)
-        tool_box.pack_start(tool_radio_box, False, False, 5)
-
-        self.tool_transparent = Gtk.RadioButton.new_with_label(None, "Transparent-Background (standaard)")
-        self.tool_transparent.connect("toggled", self.on_tool_changed, "transparent-background")
-        tool_radio_box.pack_start(self.tool_transparent, False, False, 0)
-
-        self.tool_rembg = Gtk.RadioButton.new_with_label_from_widget(self.tool_transparent, "Rembg (alternatief)")
-        self.tool_rembg.connect("toggled", self.on_tool_changed, "rembg")
-        tool_radio_box.pack_start(self.tool_rembg, False, False, 0)
-
-        tool_status_box = Gtk.Box(spacing=10)
-        tool_box.pack_start(tool_status_box, False, False, 5)
-
-        self.tool_status_label = Gtk.Label()
-        self.tool_status_label.set_markup("<small>Controleren van geïnstalleerde tools...</small>")
-        tool_status_box.pack_start(self.tool_status_label, False, False, 0)
-
-        self.check_installed_tools()
-
-        # ===== OPTIES =====
-        options_frame = Gtk.Frame(label="Verwerkingsopties")
-        options_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        options_frame.add(options_box)
-        locations_box.pack_start(options_frame, False, False, 8)
-
-        self.auto_rotate_check = Gtk.CheckButton(label="Auto-rotatie (EXIF data)")
-        self.auto_rotate_check.set_active(True)
-        options_box.pack_start(self.auto_rotate_check, False, False, 0)
-
-        self.color_enhance_check = Gtk.CheckButton(label="Kleuren verbeteren (automatisch)")
-        self.color_enhance_check.set_active(True)
-        options_box.pack_start(self.color_enhance_check, False, False, 0)
-
-        # ===== OPSLAAN KNOOP =====
-        button_box = Gtk.Box(spacing=10)
-        button_box.set_margin_top(10)
-        content_box.pack_start(button_box, False, False, 0)
-
-        save_btn = Gtk.Button(label="💾 Instellingen Opslaan")
-        save_btn.connect("clicked", self.save_config)
-        button_box.pack_start(save_btn, False, False, 0)
-
-        self.source_type_map.set_active(True)
-        self.on_source_type_changed(None, "map")
-
-        return page
-
-    def on_source_type_changed(self, widget, source_type):
-        is_map = (source_type == "map")
-        self.src_entry.set_sensitive(is_map)
-        self.files_treeview.set_sensitive(not is_map)
-
-        if is_map:
-            self.config['source_type'] = 'map'
-            self.files_count_label.set_markup("<small>Bronmap modus (alle bestanden in map worden gebruikt)</small>")
-        else:
-            self.config['source_type'] = 'files'
-            count = len(self.files_list)
-            self.files_count_label.set_markup(f"<small>{count} bestanden geselecteerd</small>")
-
-    def browse_files_with_icons(self, widget):
-        chooser = CustomFileChooser(self, "Selecteer foto's (grote pictogrammen)", select_multiple=True)
-        response = chooser.run()
-
-        if response == Gtk.ResponseType.OK:
-            filenames = chooser.get_filenames()
-            for filename in filenames:
-                exists = False
-                for row in self.files_list:
-                    if row[1] == filename:
-                        exists = True
-                        break
-
-                if not exists:
-                    self.files_list.append([os.path.basename(filename), filename])
-
-            count = len(self.files_list)
-            self.files_count_label.set_markup(f"<small>{count} bestanden geselecteerd</small>")
-            self.log_message(f"{len(filenames)} bestanden toegevoegd")
-
-        chooser.destroy()
-
-    def remove_selected_file(self, widget):
-        selection = self.files_treeview.get_selection()
-        model, iter_ = selection.get_selected()
-        if iter_:
-            filename = model[iter_][0]
-            self.files_list.remove(iter_)
-            count = len(self.files_list)
-            self.files_count_label.set_markup(f"<small>{count} bestanden geselecteerd</small>")
-            self.log_message(f"Verwijderd: {filename}")
-
-    def clear_file_list(self, widget):
-        self.files_list.clear()
-        self.files_count_label.set_markup("<small>0 bestanden geselecteerd</small>")
-        self.log_message("Bestandenlijst geleegd")
-
-    def get_source_files(self):
-        if self.source_type_map.get_active():
-            source_dir = self.config.get('source_dir', '')
-            if source_dir and os.path.exists(source_dir):
-                image_files = []
-                for ext in ['*.jpg', '*.JPG', '*.jpeg', '*.JPEG', '*.png', '*.PNG']:
-                    image_files.extend(glob.glob(os.path.join(source_dir, ext)))
-                return image_files
-            return []
-        else:
-            return [row[1] for row in self.files_list if os.path.exists(row[1])]
-
-    def check_installed_tools(self):
-        tools_status = []
-
-        try:
-            import transparent_background
-            tools_status.append("✅ Transparent-Background (geïnstalleerd)")
-            self.tool_transparent.set_sensitive(True)
-        except ImportError:
-            tools_status.append("❌ Transparent-Background (niet geïnstalleerd)")
-            self.tool_transparent.set_sensitive(False)
-
-        try:
-            import rembg
-            tools_status.append("✅ Rembg (geïnstalleerd)")
-            self.tool_rembg.set_sensitive(True)
-        except ImportError:
-            tools_status.append("❌ Rembg (niet geïnstalleerd)")
-            self.tool_rembg.set_sensitive(False)
-
-        status_text = " | ".join(tools_status)
-        self.tool_status_label.set_markup(f"<small>{status_text}</small>")
-
-        if self.config.get('bg_removal_tool') == 'transparent-background' and self.tool_transparent.get_sensitive():
-            self.tool_transparent.set_active(True)
-        elif self.config.get('bg_removal_tool') == 'rembg' and self.tool_rembg.get_sensitive():
-            self.tool_rembg.set_active(True)
-        elif self.tool_transparent.get_sensitive():
-            self.tool_transparent.set_active(True)
-        elif self.tool_rembg.get_sensitive():
-            self.tool_rembg.set_active(True)
-
-    def on_tool_changed(self, widget, tool_name):
-        if widget.get_active():
-            self.config['bg_removal_tool'] = tool_name
-            self.log_message(f"Tool gewijzigd naar: {tool_name}")
-
-    def browse_source(self, widget):
-        dialog = Gtk.FileChooserDialog(title="Selecteer bronmap", parent=self, action=Gtk.FileChooserAction.SELECT_FOLDER)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
-        if dialog.run() == Gtk.ResponseType.OK:
-            self.src_entry.set_text(dialog.get_filename())
-        dialog.destroy()
-
-    def browse_output(self, widget):
-        dialog = Gtk.FileChooserDialog(title="Selecteer uitvoermap", parent=self, action=Gtk.FileChooserAction.SELECT_FOLDER)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
-        if dialog.run() == Gtk.ResponseType.OK:
-            self.out_entry.set_text(dialog.get_filename())
-        dialog.destroy()
-
-    def browse_watermark(self, widget):
-        dialog = Gtk.FileChooserDialog(title="Selecteer watermerk", parent=self, action=Gtk.FileChooserAction.OPEN)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
-        filter_png = Gtk.FileFilter()
-        filter_png.set_name("PNG afbeeldingen")
-        filter_png.add_mime_type("image/png")
-        dialog.add_filter(filter_png)
-        if dialog.run() == Gtk.ResponseType.OK:
-            self.wm_entry.set_text(dialog.get_filename())
-        dialog.destroy()
-
-    def browse_logo(self, widget):
-        dialog = Gtk.FileChooserDialog(title="Selecteer logo", parent=self, action=Gtk.FileChooserAction.OPEN)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
-        filter_img = Gtk.FileFilter()
-        filter_img.set_name("Afbeeldingen")
-        filter_img.add_mime_type("image/png")
-        filter_img.add_mime_type("image/jpeg")
-        dialog.add_filter(filter_img)
-        if dialog.run() == Gtk.ResponseType.OK:
-            self.logo_entry.set_text(dialog.get_filename())
-        dialog.destroy()
-
-    def browse_background_image(self, widget):
-        dialog = Gtk.FileChooserDialog(title="Selecteer achtergrond afbeelding", parent=self, action=Gtk.FileChooserAction.OPEN)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
-        filter_img = Gtk.FileFilter()
-        filter_img.set_name("Afbeeldingen")
-        filter_img.add_mime_type("image/png")
-        filter_img.add_mime_type("image/jpeg")
-        dialog.add_filter(filter_img)
-        if dialog.run() == Gtk.ResponseType.OK:
-            self.bg_image_entry.set_text(dialog.get_filename())
-        dialog.destroy()
-
-    def on_src_changed(self, widget):
-        self.config['source_dir'] = widget.get_text()
-
-    def on_out_changed(self, widget):
-        self.config['output_dir'] = widget.get_text()
-
-    def on_wm_changed(self, widget):
-        self.config['watermark_path'] = widget.get_text()
-
-    def on_logo_changed(self, widget):
-        self.config['logo_path'] = widget.get_text()
-
-    def on_background_type_changed(self, widget):
-        selected = self.bg_type_combo.get_active()
-        self.bg_color_entry.set_sensitive(selected == 1)
-        self.bg_image_entry.set_sensitive(selected == 2)
-
-    def create_processing_page(self):
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        page.set_border_width(10)
-
-        self.info_label = Gtk.Label()
-        self.info_label.set_markup("<span size='large'>Klik op 'Start Verwerking'</span>")
-        page.pack_start(self.info_label, False, False, 0)
-
-        self.progress_bar = Gtk.ProgressBar()
-        page.pack_start(self.progress_bar, False, False, 0)
-
-        self.start_btn = Gtk.Button(label="Start Verwerking")
-        self.start_btn.connect("clicked", self.start_processing)
-        page.pack_start(self.start_btn, False, False, 0)
-
-        self.stop_btn = Gtk.Button(label="Stop Verwerking")
-        self.stop_btn.connect("clicked", self.stop_processing_callback)
-        self.stop_btn.set_sensitive(False)
-        page.pack_start(self.stop_btn, False, False, 0)
-
-        self.next_project_btn = Gtk.Button(label="Door naar Volgende Project")
-        self.next_project_btn.connect("clicked", self.next_project)
-        self.next_project_btn.set_sensitive(False)
-        page.pack_start(self.next_project_btn, False, False, 0)
-
-        return page
-
-    def create_log_page(self):
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        page.set_border_width(10)
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        page.pack_start(scrolled, True, True, 0)
-        self.log_textview = Gtk.TextView()
-        self.log_textview.set_editable(False)
-        self.log_textview.set_wrap_mode(Gtk.WrapMode.WORD)
-        scrolled.add(self.log_textview)
-        clear_btn = Gtk.Button(label="Logboek Wissen")
-        clear_btn.connect("clicked", self.clear_log)
-        page.pack_start(clear_btn, False, False, 0)
-        return page
-
-    def log_message(self, message, is_error=False):
-        self.log_queue.put((message, is_error))
-
-    def process_log_queue(self):
-        try:
-            while not self.log_queue.empty():
-                message, is_error = self.log_queue.get_nowait()
-                buffer = self.log_textview.get_buffer()
-                end_iter = buffer.get_end_iter()
-                timestamp = time.strftime("%H:%M:%S")
-                log_line = f"[{timestamp}] {message}\n"
-                buffer.insert(end_iter, log_line)
-                self.log_textview.scroll_to_iter(buffer.get_end_iter(), 0, False, 0, 0)
-                self.statusbar.push(self.status_context, message[:50])
-                print(log_line.strip())
-        except Exception as e:
-            print(f"Error: {e}")
-        return True
-
-    def cancel_processing(self):
-        self.log_message("Verwerking geannuleerd")
-        self.stop_flag = True
-        GLib.idle_add(self.reset_ui_after_stop)
-
-    def stop_processing_callback(self, widget):
-        self.log_message("Stop signaal...")
-        self.stop_flag = True
-
-    def save_config(self, widget):
-        self.config['source_dir'] = self.src_entry.get_text()
-        self.config['output_dir'] = self.out_entry.get_text()
-        self.config['watermark_path'] = self.wm_entry.get_text()
-        self.config['logo_path'] = self.logo_entry.get_text()
-        self.config['auto_rotate'] = self.auto_rotate_check.get_active()
-        self.config['color_enhance'] = self.color_enhance_check.get_active()
-
-        selected = self.bg_type_combo.get_active()
-        if selected == 0: self.config['background_type'] = 'white'
-        elif selected == 1: self.config['background_type'] = 'color'
-        elif selected == 2: self.config['background_type'] = 'image'
-        else: self.config['background_type'] = 'original'
-
-        self.config['background_color'] = self.bg_color_entry.get_text()
-        self.config['background_image'] = self.bg_image_entry.get_text()
-
-        self.config['source_files'] = [row[1] for row in self.files_list]
-
-        with open(os.path.expanduser("~/.marktplaats_manager_config.json"), 'w') as f:
-            json.dump(self.config, f, indent=2)
-        self.log_message("Instellingen opgeslagen")
-        dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, text="Instellingen opgeslagen!")
-        dialog.run()
-        dialog.destroy()
-
-    def load_config(self):
-        config_file = os.path.expanduser("~/.marktplaats_manager_config.json")
-        if os.path.exists(config_file):
-            try:
-                with open(config_file, 'r') as f:
-                    saved_config = json.load(f)
-                    self.config.update(saved_config)
-
-                self.src_entry.set_text(self.config.get('source_dir', ''))
-                self.out_entry.set_text(self.config.get('output_dir', ''))
-                self.wm_entry.set_text(self.config.get('watermark_path', ''))
-                self.logo_entry.set_text(self.config.get('logo_path', ''))
-                self.auto_rotate_check.set_active(self.config.get('auto_rotate', True))
-                self.color_enhance_check.set_active(self.config.get('color_enhance', True))
-
-                if 'source_files' in self.config:
-                    for file_path in self.config['source_files']:
-                        if os.path.exists(file_path):
-                            self.files_list.append([os.path.basename(file_path), file_path])
-                    count = len(self.files_list)
-                    self.files_count_label.set_markup(f"<small>{count} bestanden geselecteerd</small>")
-
-                bg_type = self.config.get('background_type', 'white')
-                if bg_type == 'white': self.bg_type_combo.set_active(0)
-                elif bg_type == 'color': self.bg_type_combo.set_active(1)
-                elif bg_type == 'image': self.bg_type_combo.set_active(2)
-                else: self.bg_type_combo.set_active(3)
-
-                self.bg_color_entry.set_text(self.config.get('background_color', '#ffffff'))
-                self.bg_image_entry.set_text(self.config.get('background_image', ''))
-                self.on_background_type_changed(None)
-
-                self.log_message("Configuratie geladen")
-            except Exception as e:
-                self.log_message(f"Fout bij laden: {e}", True)
-
-    def start_processing(self, widget):
-        source_files = self.get_source_files()
-
-        if not source_files:
-            self.show_error("Geen bronbestanden geselecteerd!\nSelecteer een bronmap of voeg bestanden toe.")
-            return
-
-        if not self.config['output_dir']:
-            self.show_error("Selecteer een uitvoermap")
-            return
-
-        self.log_message(f"{len(source_files)} bronbestanden gevonden")
-        self.config['current_source_files'] = source_files
-
-        bg_type = self.config.get('background_type', 'white')
-
-        if bg_type != 'original':
-            tool = self.config.get('bg_removal_tool', 'transparent-background')
-            if tool == 'transparent-background':
-                try:
-                    import transparent_background
-                except ImportError:
-                    self.show_error("Transparent-Background is niet geïnstalleerd!\nInstalleer met: pip install transparent-background")
-                    return
-            else:
-                try:
-                    import rembg
-                except ImportError:
-                    self.show_error("Rembg is niet geïnstalleerd!\nInstalleer met: pip install rembg")
-                    return
-
-        self.start_btn.set_sensitive(False)
-        self.stop_btn.set_sensitive(True)
-        self.next_project_btn.set_sensitive(False)
-        self.progress_bar.set_fraction(0)
-        self.info_label.set_markup("<span size='large'>Bezig met verwerken...</span>")
-        self.stop_flag = False
-
-        thread = threading.Thread(target=self.process_images)
-        thread.daemon = False
-        thread.start()
-
-    def update_progress_safe(self, fraction):
-        GLib.idle_add(self._update_progress, fraction)
-
-    def _update_progress(self, fraction):
-        self.progress_bar.set_fraction(fraction)
-        if fraction < 1.0:
-            self.info_label.set_markup(f"<span size='large'>Verwerking: {int(fraction * 100)}%</span>")
-        else:
-            self.info_label.set_markup("<span size='large' color='green'>Verwerking voltooid!</span>")
-        return False
-
-    def process_remove_background_rembg(self, image_paths, output_dir):
-        self.log_message("Achtergrond verwijderen met rembg...")
-        output_files = []
-
-        for i, img in enumerate(image_paths):
-            if self.stop_flag:
-                return []
-
-            base_name = os.path.splitext(os.path.basename(img))[0]
-            output_path = os.path.join(output_dir, f"{base_name}.png")
-
-            try:
-                from rembg import remove
-
-                with open(img, 'rb') as f:
-                    input_data = f.read()
-                output_data = remove(input_data)
-
-                with open(output_path, 'wb') as f:
-                    f.write(output_data)
-
-                output_files.append(output_path)
-                self.log_message(f"Rembg: {i+1}/{len(image_paths)} verwerkt")
-
-            except Exception as e:
-                self.log_message(f"Fout met rembg voor {img}: {e}", True)
-                shutil.copy2(img, output_path)
-                output_files.append(output_path)
-
-            progress = 0.5 + ((i + 1) / len(image_paths)) * 0.1
-            self.update_progress_safe(progress)
-
-        return output_files
-
-    def process_remove_background_transparent(self, image_paths, output_dir):
-        self.log_message("Achtergrond verwijderen met transparent-background...")
-
-        for batch_start in range(0, len(image_paths), 3):
-            if self.stop_flag:
-                return []
-
-            batch = image_paths[batch_start:batch_start + 3]
-            temp_dir = tempfile.mkdtemp()
-
-            self.log_message(f"Batch {batch_start//3 + 1}: {len(batch)} afbeeldingen")
-
-            for img in batch:
-                shutil.copy2(img, os.path.join(temp_dir, os.path.basename(img)))
-
-            cmd = ["transparent-background", "--source", temp_dir, "--dest", output_dir,
-                   "--type", "rgba", "--mode", "base", "--device", "cpu", "--format", "png"]
-
-            success, output = run_safe_command(cmd, timeout=600)
-
-            if not success:
-                self.log_message(f"Fout bij transparent-background: {output}", True)
-
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            progress = 0.5 + ((batch_start + len(batch)) / len(image_paths)) * 0.1
-            self.update_progress_safe(progress)
-
-        output_files = glob.glob(os.path.join(output_dir, "*.png"))
-        self.log_message(f"{len(output_files)} PNG bestanden gevonden in {output_dir}")
-
-        return output_files
-
-    def process_images(self):
-        try:
-            self.log_message("=== START VERWERKING ===")
-
-            bg_type = self.config.get('background_type', 'white')
-            is_original = (bg_type == 'original')
-
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            input_dir = os.path.join(base_dir, "input")
-            enhance_dir = os.path.join(base_dir, "output")
-
-            for d in [input_dir, enhance_dir]:
-                if os.path.exists(d):
-                    shutil.rmtree(d, ignore_errors=True)
-                os.makedirs(d, exist_ok=True)
-
-            if self.stop_flag: return
-
-            source_files = self.config.get('current_source_files', [])
-
-            if not source_files:
-                self.log_message("Geen bronbestanden gevonden!", True)
-                GLib.idle_add(self.reset_ui_after_error)
-                return
-
-            self.log_message(f"{len(source_files)} afbeeldingen om te verwerken")
-
-            self.log_message("Stap 1: Kopieer afbeeldingen...")
-            copied_files = []
-            for i, img in enumerate(source_files):
-                if self.stop_flag: return
-                dest = os.path.join(input_dir, os.path.basename(img))
-                shutil.copy2(img, dest)
-                copied_files.append(dest)
-                self.update_progress_safe((i + 1) / len(source_files) * 0.2)
-
-            if is_original:
-                self.log_message("Originele achtergrond behouden - overslaan van achtergrond verwijdering")
-                self.transparent_pngs = copied_files
-                self.log_message(f"{len(self.transparent_pngs)} originele afbeeldingen worden gebruikt")
-                self.update_progress_safe(0.6)
-
-                if self.transparent_pngs:
-                    GLib.idle_add(self.show_inspection_window)
-                else:
-                    self.log_message("Geen afbeeldingen!", True)
-                    GLib.idle_add(self.reset_ui_after_error)
-                return
-
-            if self.config['auto_rotate']:
-                self.log_message("Stap 2: Auto-rotatie...")
-                for i, img in enumerate(copied_files):
-                    if self.stop_flag: return
-                    run_safe_command(["mogrify", "-auto-orient", img], timeout=60)
-                    self.update_progress_safe(0.2 + (i / len(copied_files)) * 0.1)
-
-            self.log_message("Stap 3: Verkleinen naar 50%...")
-            for i, img in enumerate(copied_files):
-                if self.stop_flag: return
-                run_safe_command(["mogrify", "-colorspace", "RGB", "-resize", "50%", "-colorspace", "sRGB", img], timeout=120)
-                self.update_progress_safe(0.3 + (i / len(copied_files)) * 0.1)
-
-            if self.config['color_enhance']:
-                self.log_message("Stap 4: Kleurverbetering...")
-                for i, img in enumerate(copied_files):
-                    if self.stop_flag: return
-                    dest = os.path.join(enhance_dir, os.path.basename(img))
-                    shutil.copy2(img, dest)
-                    self.update_progress_safe(0.4 + (i / len(copied_files)) * 0.1)
-
-                enhancer_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "image_enhancer.py")
-                if os.path.exists(enhancer_script):
-                    run_safe_command(["python3", enhancer_script], timeout=300)
-                processed_dir = enhance_dir
-            else:
-                processed_dir = input_dir
-
-            tool = self.config.get('bg_removal_tool', 'transparent-background')
-            self.log_message(f"Stap 5: Transparante achtergrond maken met {tool}...")
-
-            transparent_dir = os.path.join(self.config['output_dir'], "transparant")
-            if os.path.exists(transparent_dir):
-                shutil.rmtree(transparent_dir, ignore_errors=True)
-            os.makedirs(transparent_dir, exist_ok=True)
-
-            images_to_process = glob.glob(os.path.join(processed_dir, "*.jpg")) + glob.glob(os.path.join(processed_dir, "*.JPG"))
-            self.log_message(f"{len(images_to_process)} afbeeldingen te verwerken")
-
-            if tool == 'rembg':
-                self.transparent_pngs = self.process_remove_background_rembg(images_to_process, transparent_dir)
-            else:
-                self.transparent_pngs = self.process_remove_background_transparent(images_to_process, transparent_dir)
-
-            self.log_message(f"{len(self.transparent_pngs)} transparante PNGs gemaakt")
-            self.update_progress_safe(0.6)
-
-            if self.transparent_pngs:
-                GLib.idle_add(self.show_inspection_window)
-            else:
-                self.log_message("Geen afbeeldingen!", True)
-                GLib.idle_add(self.reset_ui_after_error)
-
-        except Exception as e:
-            self.log_message(f"Fout: {str(e)}", True)
-            GLib.idle_add(self.reset_ui_after_error)
-
-    def show_inspection_window(self):
-        self.log_message("Open inspectievenster...")
-        try:
-            self.inspect_window = ImagePreviewWindow(self, self.transparent_pngs)
-            self.inspect_window.show_all()
-        except Exception as e:
-            self.log_message(f"Fout: {e}", True)
-
-    def add_background_to_png(self, png_path, output_path, bg_type, bg_color=None, bg_image=None):
-        try:
-            img = Image.open(png_path)
-
-            if bg_type == 'color' and bg_color:
-                bg_color = bg_color.lstrip('#')
-                rgb = tuple(int(bg_color[i:i+2], 16) for i in (0, 2, 4))
-                background = Image.new('RGB', img.size, rgb)
-                if img.mode == 'RGBA':
-                    background.paste(img, (0, 0), img.split()[3])
-                else:
-                    background.paste(img, (0, 0))
-                background.save(output_path, 'JPEG', quality=95)
-
-            elif bg_type == 'image' and bg_image and os.path.exists(bg_image):
-                bg_img = crop_and_scale_background(bg_image, img.size)
-                if bg_img is not None:
-                    if img.mode == 'RGBA':
-                        bg_img.paste(img, (0, 0), img.split()[3])
-                    else:
-                        bg_img.paste(img, (0, 0))
-                    bg_img.save(output_path, 'JPEG', quality=95)
-                else:
-                    background = Image.new('RGB', img.size, (255, 255, 255))
-                    if img.mode == 'RGBA':
-                        background.paste(img, (0, 0), img.split()[3])
-                    else:
-                        background.paste(img, (0, 0))
-                    background.save(output_path, 'JPEG', quality=95)
-
-            else:
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                if img.mode == 'RGBA':
-                    background.paste(img, (0, 0), img.split()[3])
-                else:
-                    background.paste(img, (0, 0))
-                background.save(output_path, 'JPEG', quality=95)
-
-            return True
-        except Exception as e:
-            self.log_message(f"Fout bij toevoegen achtergrond: {e}", True)
-            return False
-
-    def process_after_inspection(self):
-        self.log_message("Start genereren van eindproducten...")
-
-        if not self.transparent_pngs:
-            self.log_message("Geen transparante PNGs!", True)
-            GLib.idle_add(self.reset_ui_after_error)
-            return
-
-        bg_type = self.config.get('background_type', 'white')
-        is_original = (bg_type == 'original')
-        bg_color = self.config.get('background_color', '#ffffff') if bg_type == 'color' else None
-        bg_image = self.config.get('background_image', '') if bg_type == 'image' else None
-
-        has_watermark = self.config['watermark_path'] and os.path.exists(self.config['watermark_path'])
-        has_logo = self.config['logo_path'] and os.path.exists(self.config['logo_path'])
-
-        temp_square_dir = os.path.join(self.config['output_dir'], "temp_square")
-        os.makedirs(temp_square_dir, exist_ok=True)
-
-        self.log_message("Stap 1: Vierkant maken van afbeeldingen (2040x2040)...")
-        square_pngs = []
-
-        for i, png in enumerate(self.transparent_pngs):
-            if self.stop_flag:
-                self.log_message("Verwerking gestopt")
-                GLib.idle_add(self.reset_ui_after_stop)
-                return
-
-            square_png = os.path.join(temp_square_dir, f"square_{i:03d}.png")
-            shutil.copy2(png, square_png)
-
-            try:
-                img = Image.open(square_png)
-                square_size = 2040
-                square_canvas = Image.new('RGBA' if not is_original else 'RGB', (square_size, square_size), (0, 0, 0, 0))
-
-                x_offset = (square_size - img.width) // 2
-                y_offset = (square_size - img.height) // 2
-
-                if img.mode == 'RGBA' and not is_original:
-                    square_canvas.paste(img, (x_offset, y_offset), img)
-                else:
-                    square_canvas.paste(img, (x_offset, y_offset))
-
-                square_canvas.save(square_png, 'PNG' if not is_original else 'JPEG', quality=95)
-                square_pngs.append(square_png)
-            except Exception as e:
-                self.log_message(f"Fout bij vierkant maken: {e}", True)
-                square_pngs.append(square_png)
-
-            progress = 0.7 + ((i + 1) / len(self.transparent_pngs)) * 0.1
-            self.update_progress_safe(progress)
-
-        if is_original:
-            self.log_message("Originele achtergrond behouden - alleen logo/watermerk toevoegen")
-
-            rand_prefix = ''.join(random.choices(string.ascii_uppercase, k=3))
-            files_with_logo = []
-
-            temp_with_logo_dir = os.path.join(self.config['output_dir'], "temp_with_logo")
-            os.makedirs(temp_with_logo_dir, exist_ok=True)
-
-            for i, png in enumerate(square_pngs):
-                if self.stop_flag:
-                    self.log_message("Verwerking gestopt")
-                    GLib.idle_add(self.reset_ui_after_stop)
-                    return
-
-                jpg_path = os.path.join(temp_with_logo_dir, f"logo_{i:03d}.jpg")
-                shutil.copy2(png, jpg_path)
-
-                if has_watermark:
-                    run_safe_command(["mogrify", "-path", temp_with_logo_dir, "-draw", f"image over 0,0 0,0 '{self.config['watermark_path']}'", jpg_path], timeout=60)
-                if has_logo:
-                    run_safe_command(["mogrify", "-gravity", "northeast", "-geometry", "+10+10", "-draw", f"image over 0,0 0,0 '{self.config['logo_path']}'", jpg_path], timeout=60)
-
-                files_with_logo.append(jpg_path)
-                self.update_progress_safe(0.8 + (i / len(square_pngs)) * 0.1)
-
-            self.update_progress_safe(0.95)
-
-            GLib.idle_add(self.ask_for_article_number_original, files_with_logo, temp_with_logo_dir, temp_square_dir)
-            return
-
-        # Normale flow
-        self.log_message("Stap 2: Achtergrond toevoegen aan vierkante afbeeldingen...")
-
-        white_files = []
-        bg_files = []
-
-        for i, png in enumerate(square_pngs):
-            if self.stop_flag:
-                self.log_message("Verwerking gestopt")
-                GLib.idle_add(self.reset_ui_after_stop)
-                return
-
-            white_jpg = png.replace('.png', '_white.jpg')
-            if self.add_background_to_png(png, white_jpg, 'white', None, None):
-                white_files.append(white_jpg)
-
-            if bg_type != 'white':
-                bg_jpg = png.replace('.png', '_bg.jpg')
-                if self.add_background_to_png(png, bg_jpg, bg_type, bg_color, bg_image):
-                    bg_files.append(bg_jpg)
-
-            progress = 0.8 + ((i + 1) / len(square_pngs)) * 0.05
-            self.update_progress_safe(progress)
-
-        self.log_message("Stap 3: Watermerk en logo toevoegen...")
-
-        white_with_logo = []
-        bg_with_logo = []
-
-        if has_watermark or has_logo:
-            for img in white_files:
-                new_path = img.replace('.jpg', '_with_logo.jpg')
-                shutil.copy2(img, new_path)
-                white_with_logo.append(new_path)
-
-            for img in bg_files:
-                new_path = img.replace('.jpg', '_with_logo.jpg')
-                shutil.copy2(img, new_path)
-                bg_with_logo.append(new_path)
-
-            if has_watermark:
-                for img in white_with_logo + bg_with_logo:
-                    run_safe_command(["mogrify", "-path", os.path.dirname(img), "-draw", f"image over 0,0 0,0 '{self.config['watermark_path']}'", img], timeout=60)
-                self.log_message("Watermerk toegevoegd")
-
-            if has_logo:
-                for img in white_with_logo + bg_with_logo:
-                    run_safe_command(["mogrify", "-gravity", "northeast", "-geometry", "+10+10", "-draw", f"image over 0,0 0,0 '{self.config['logo_path']}'", img], timeout=60)
-                self.log_message("Logo toegevoegd")
-        else:
-            self.log_message("Geen watermerk of logo geselecteerd, map met_logo wordt niet aangemaakt")
-
-        self.update_progress_safe(0.95)
-
-        GLib.idle_add(self.ask_for_article_number, white_files, white_with_logo, bg_files, bg_with_logo, temp_square_dir, has_watermark or has_logo)
-
-    def ask_for_article_number_original(self, files_with_logo, temp_with_logo_dir, temp_square_dir):
-        self.log_message("Vraag artikelnummer (originele achtergrond modus)...")
-
-        dialog = Gtk.Dialog(title="Artikelnummer", parent=self, flags=0)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
-        dialog.set_default_size(500, 350)
-
-        box = dialog.get_content_area()
-        box.set_spacing(10)
-        box.set_border_width(10)
-
-        label = Gtk.Label(label="Voer artikel/locatie nummer in:")
-        label.set_xalign(0)
-        box.pack_start(label, False, False, 0)
-
-        entry = Gtk.Entry()
-        entry.set_placeholder_text("Bijv: 12345 of KLANT_A")
-        entry.set_size_request(300, -1)
-        box.pack_start(entry, False, False, 0)
-
-        info_text = "Mappen die worden aangemaakt:\n\n"
-        info_text += "📁 met_logo/           - JPEG met logo/watermerk (originele achtergrond behouden)\n"
-        info_text += "📁 originelen/         - Originele foto's uit bronmap (optioneel)"
-
-        info_label = Gtk.Label()
-        info_label.set_markup(f"<small>{info_text}</small>")
-        info_label.set_xalign(0)
-        box.pack_start(info_label, False, False, 0)
-
-        move_originals_check = Gtk.CheckButton(label="Originele foto's verplaatsen naar map 'originelen/'")
-        move_originals_check.set_active(True)
-        box.pack_start(move_originals_check, False, False, 5)
-
-        dialog.show_all()
+        
+        self.config = ConfigManager()
+        
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(vbox)
+        
+        # Menubalk met instellingen
+        menu_row = Gtk.Box(spacing=5)
+        menu_row.set_border_width(5)
+        settings_btn = Gtk.Button(label="⚙️ Instellingen")
+        settings_btn.connect("clicked", self._open_settings)
+        menu_row.pack_end(settings_btn, False, False, 0)
+        
+        backend_label = Gtk.Label()
+        backend_label.set_markup(f"<small>Actieve opslag: <b>{self.config.get('storage_backend')}</b></small>")
+        self.backend_label = backend_label
+        menu_row.pack_start(backend_label, False, False, 5)
+        vbox.pack_start(menu_row, False, False, 0)
+        
+        # Tabs
+        self.notebook = Gtk.Notebook()
+        vbox.pack_start(self.notebook, True, True, 0)
+        
+        self.registreer_tab = RegistreerTab(self)
+        self.notebook.append_page(self.registreer_tab, Gtk.Label(label="📝 Registreren"))
+        
+        self.overzicht_tab = OverzichtTab(self)
+        self.notebook.append_page(self.overzicht_tab, Gtk.Label(label="📊 Overzicht"))
+    
+    def _open_settings(self, widget):
+        dialog = SettingsDialog(self, self.config)
         response = dialog.run()
-
         if response == Gtk.ResponseType.OK:
-            article_number = entry.get_text().strip()
-            if article_number:
-                final_dir = os.path.join(os.path.dirname(self.config['output_dir']), article_number)
-                os.makedirs(final_dir, exist_ok=True)
-
-                dir_with_logo = os.path.join(final_dir, "met_logo")
-                os.makedirs(dir_with_logo, exist_ok=True)
-
-                rand_prefix = ''.join(random.choices(string.ascii_uppercase, k=3))
-
-                for i, img in enumerate(files_with_logo):
-                    if os.path.exists(img):
-                        new_name = f"{rand_prefix}_{i+1:03d}.jpg"
-                        dest = os.path.join(dir_with_logo, new_name)
-                        shutil.move(img, dest)
-
-                if move_originals_check.get_active():
-                    dir_originals = os.path.join(final_dir, "originelen")
-                    os.makedirs(dir_originals, exist_ok=True)
-                    originals_count = 0
-                    for ext in ['*.jpg', '*.JPG', '*.jpeg', '*.JPEG']:
-                        for img in glob.glob(os.path.join(self.config['source_dir'], ext)):
-                            dest = os.path.join(dir_originals, os.path.basename(img))
-                            shutil.move(img, dest)
-                            originals_count += 1
-                    self.log_message(f"Originelen: {originals_count} bestanden")
-
-                shutil.rmtree(temp_square_dir, ignore_errors=True)
-                shutil.rmtree(temp_with_logo_dir, ignore_errors=True)
-
-                self.log_message(f"=== VERWERKING VOLTOOID! ===")
-                self.log_message(f"Bestanden opgeslagen in: {final_dir}")
-
-                success_msg = f"✅ Verwerking voltooid!\n\n"
-                success_msg += f"📁 met_logo/ - {len(files_with_logo)} bestanden\n"
-                success_msg += f"\n📍 Locatie: {final_dir}"
-
-                success_dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, text="Verwerking voltooid!")
-                success_dialog.format_secondary_text(success_msg)
-                success_dialog.run()
-                success_dialog.destroy()
-
-                self.update_progress_safe(1.0)
-                self.next_project_btn.set_sensitive(True)
-
+            dialog.apply_to_config()
+            self.backend_label.set_markup(f"<small>Actieve opslag: <b>{self.config.get('storage_backend')}</b></small>")
+            # Comboboxen in registreer-tab verversen met eventueel gewijzigde lijsten
+            self._herbouw_registreer_tab()
         dialog.destroy()
-        self.start_btn.set_sensitive(True)
-        self.stop_btn.set_sensitive(False)
-
-    def ask_for_article_number(self, white_files, white_with_logo, bg_files, bg_with_logo, temp_square_dir, has_logo_files):
-        self.log_message("Vraag artikelnummer...")
-
-        dialog = Gtk.Dialog(title="Artikelnummer", parent=self, flags=0)
-        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
-        dialog.set_default_size(500, 450)
-
-        box = dialog.get_content_area()
-        box.set_spacing(10)
-        box.set_border_width(10)
-
-        label = Gtk.Label(label="Voer artikel/locatie nummer in:")
-        label.set_xalign(0)
-        box.pack_start(label, False, False, 0)
-
-        entry = Gtk.Entry()
-        entry.set_placeholder_text("Bijv: 12345 of KLANT_A")
-        entry.set_size_request(300, -1)
-        box.pack_start(entry, False, False, 0)
-
-        bg_type = self.config.get('background_type', 'white')
-        tool = self.config.get('bg_removal_tool', 'transparent-background')
-
-        info_text = f"Mappen die worden aangemaakt:\n\n"
-        info_text += f"📁 transparant/        - Vierkante PNG met transparante achtergrond (2040x2040)\n"
-        info_text += f"   (gemaakt met: {tool})\n"
-        info_text += f"📁 zonder_logo/        - JPEG met witte achtergrond\n"
-
-        if has_logo_files:
-            info_text += f"📁 met_logo/           - JPEG met witte achtergrond + watermerk/logo\n"
-
-        if bg_type != 'white':
-            info_text += "📁 zonder_logo_bg/     - JPEG met gekozen achtergrond\n"
-            if has_logo_files:
-                info_text += "📁 met_logo_bg/        - JPEG met gekozen achtergrond + watermerk/logo\n"
-
-        info_text += "\n📁 originelen/         - Originele foto's uit bronmap (optioneel)"
-
-        info_label = Gtk.Label()
-        info_label.set_markup(f"<small>{info_text}</small>")
-        info_label.set_xalign(0)
-        box.pack_start(info_label, False, False, 0)
-
-        move_originals_check = Gtk.CheckButton(label="Originele foto's verplaatsen naar map 'originelen/'")
-        move_originals_check.set_active(True)
-        box.pack_start(move_originals_check, False, False, 5)
-
-        dialog.show_all()
-        response = dialog.run()
-
-        if response == Gtk.ResponseType.OK:
-            article_number = entry.get_text().strip()
-            if article_number:
-                final_dir = os.path.join(os.path.dirname(self.config['output_dir']), article_number)
-                os.makedirs(final_dir, exist_ok=True)
-
-                dir_transparent = os.path.join(final_dir, "transparant")
-                dir_without = os.path.join(final_dir, "zonder_logo")
-                os.makedirs(dir_transparent, exist_ok=True)
-                os.makedirs(dir_without, exist_ok=True)
-
-                if has_logo_files and white_with_logo:
-                    dir_with = os.path.join(final_dir, "met_logo")
-                    os.makedirs(dir_with, exist_ok=True)
-
-                for png in self.transparent_pngs:
-                    if os.path.exists(png):
-                        dest = os.path.join(dir_transparent, os.path.basename(png))
-                        shutil.move(png, dest)
-
-                rand_prefix = ''.join(random.choices(string.ascii_uppercase, k=3))
-
-                for i, img in enumerate(white_files):
-                    if os.path.exists(img):
-                        new_name = f"{rand_prefix}_{i+1:03d}.jpg"
-                        dest = os.path.join(dir_without, new_name)
-                        shutil.move(img, dest)
-
-                if has_logo_files and white_with_logo:
-                    for i, img in enumerate(white_with_logo):
-                        if os.path.exists(img):
-                            new_name = f"{rand_prefix}_{i+1:03d}.jpg"
-                            dest = os.path.join(dir_with, new_name)
-                            shutil.move(img, dest)
-
-                if bg_type != 'white' and bg_files:
-                    dir_without_bg = os.path.join(final_dir, "zonder_logo_bg")
-                    os.makedirs(dir_without_bg, exist_ok=True)
-
-                    if has_logo_files and bg_with_logo:
-                        dir_with_bg = os.path.join(final_dir, "met_logo_bg")
-                        os.makedirs(dir_with_bg, exist_ok=True)
-
-                    for i, img in enumerate(bg_files):
-                        if os.path.exists(img):
-                            new_name = f"{rand_prefix}_{i+1:03d}.jpg"
-                            dest = os.path.join(dir_without_bg, new_name)
-                            shutil.move(img, dest)
-
-                    if has_logo_files and bg_with_logo:
-                        for i, img in enumerate(bg_with_logo):
-                            if os.path.exists(img):
-                                new_name = f"{rand_prefix}_{i+1:03d}.jpg"
-                                dest = os.path.join(dir_with_bg, new_name)
-                                shutil.move(img, dest)
-
-                if move_originals_check.get_active():
-                    dir_originals = os.path.join(final_dir, "originelen")
-                    os.makedirs(dir_originals, exist_ok=True)
-                    originals_count = 0
-                    for ext in ['*.jpg', '*.JPG', '*.jpeg', '*.JPEG']:
-                        for img in glob.glob(os.path.join(self.config['source_dir'], ext)):
-                            dest = os.path.join(dir_originals, os.path.basename(img))
-                            shutil.move(img, dest)
-                            originals_count += 1
-                    self.log_message(f"Originelen: {originals_count} bestanden")
-
-                shutil.rmtree(temp_square_dir, ignore_errors=True)
-
-                self.log_message(f"=== VERWERKING VOLTOOID! ===")
-                self.log_message(f"Bestanden opgeslagen in: {final_dir}")
-
-                success_msg = f"✅ Verwerking voltooid!\n\n"
-                success_msg += f"📁 transparant/ - PNG bestanden (tool: {tool})\n"
-                success_msg += f"📁 zonder_logo/ - {len(white_files)} bestanden\n"
-                if has_logo_files:
-                    success_msg += f"📁 met_logo/ - {len(white_with_logo)} bestanden\n"
-                if bg_type != 'white' and bg_files:
-                    success_msg += f"📁 zonder_logo_bg/ - {len(bg_files)} bestanden\n"
-                    if has_logo_files:
-                        success_msg += f"📁 met_logo_bg/ - {len(bg_with_logo)} bestanden\n"
-                success_msg += f"\n📍 Locatie: {final_dir}"
-
-                success_dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, text="Verwerking voltooid!")
-                success_dialog.format_secondary_text(success_msg)
-                success_dialog.run()
-                success_dialog.destroy()
-
-                self.update_progress_safe(1.0)
-                self.next_project_btn.set_sensitive(True)
-
-        dialog.destroy()
-        self.start_btn.set_sensitive(True)
-        self.stop_btn.set_sensitive(False)
-
-    def next_project(self, widget):
-        self.log_message("=== START NIEUW PROJECT ===")
-        self.transparent_pngs = []
-        self.stop_flag = False
-
-        self.start_btn.set_sensitive(True)
-        self.stop_btn.set_sensitive(False)
-        self.next_project_btn.set_sensitive(False)
-        self.progress_bar.set_fraction(0)
-        self.info_label.set_markup("<span size='large'>Klik op 'Start Verwerking' voor een nieuw project</span>")
-
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        input_dir = os.path.join(base_dir, "input")
-        enhance_dir = os.path.join(base_dir, "output")
-
-        for d in [input_dir, enhance_dir]:
-            if os.path.exists(d):
-                shutil.rmtree(d, ignore_errors=True)
-                os.makedirs(d, exist_ok=True)
-
-        transparent_dir = os.path.join(self.config['output_dir'], "transparant")
-        shutil.rmtree(transparent_dir, ignore_errors=True)
-
-        self.log_message("Klaar voor volgend project.")
-
-    def reset_ui_after_error(self):
-        self.start_btn.set_sensitive(True)
-        self.stop_btn.set_sensitive(False)
-        self.next_project_btn.set_sensitive(False)
-        self.progress_bar.set_fraction(0)
-        self.info_label.set_markup("<span size='large' color='red'>Fout!</span>")
-        self.stop_flag = False
-        return False
-
-    def reset_ui_after_stop(self):
-        self.start_btn.set_sensitive(True)
-        self.stop_btn.set_sensitive(False)
-        self.next_project_btn.set_sensitive(False)
-        self.progress_bar.set_fraction(0)
-        self.info_label.set_markup("<span size='large' color='orange'>Gestopt.</span>")
-        self.stop_flag = False
-        return False
-
-    def show_error(self, message):
-        dialog = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.OK, text=message)
-        dialog.run()
-        dialog.destroy()
-
-    def clear_log(self, widget):
-        self.log_textview.get_buffer().set_text("")
+    
+    def _herbouw_registreer_tab(self):
+        self.notebook.remove_page(0)
+        self.registreer_tab = RegistreerTab(self)
+        self.notebook.insert_page(self.registreer_tab, Gtk.Label(label="📝 Registreren"), 0)
+        self.notebook.show_all()
 
 
 def main():
-    GLib.set_prgname("marktplaats_manager")
-    app = MarktplaatsApp()
-    app.connect("destroy", Gtk.main_quit)
-    app.show_all()
+    GLib.set_prgname("marktplaats_productmanager")
+    apply_css()
+    win = MainWindow()
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
     Gtk.main()
 
 
