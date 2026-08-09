@@ -761,6 +761,7 @@ class MarktplaatsApp(Gtk.Window):
             'background_image': '',
             'auto_rotate': True,
             'color_enhance': True,
+            'resize_50': True,
             'bg_removal_tool': 'transparent-background'
         }
 
@@ -1039,6 +1040,10 @@ class MarktplaatsApp(Gtk.Window):
         self.color_enhance_check = Gtk.CheckButton(label="Kleuren verbeteren (automatisch)")
         self.color_enhance_check.set_active(True)
         options_box.pack_start(self.color_enhance_check, False, False, 0)
+
+        self.resize_50_check = Gtk.CheckButton(label="Afbeeldingen verkleinen naar 50% (bespaart geheugen/schijfruimte)")
+        self.resize_50_check.set_active(True)
+        options_box.pack_start(self.resize_50_check, False, False, 0)
 
         button_box = Gtk.Box(spacing=10)
         button_box.set_margin_top(10)
@@ -1324,6 +1329,7 @@ class MarktplaatsApp(Gtk.Window):
         self.config['logo_path'] = self.logo_entry.get_text()
         self.config['auto_rotate'] = self.auto_rotate_check.get_active()
         self.config['color_enhance'] = self.color_enhance_check.get_active()
+        self.config['resize_50'] = self.resize_50_check.get_active()
 
         selected = self.bg_type_combo.get_active()
         if selected == 0: self.config['background_type'] = 'white'
@@ -1357,6 +1363,7 @@ class MarktplaatsApp(Gtk.Window):
                 self.logo_entry.set_text(self.config.get('logo_path', ''))
                 self.auto_rotate_check.set_active(self.config.get('auto_rotate', True))
                 self.color_enhance_check.set_active(self.config.get('color_enhance', True))
+                self.resize_50_check.set_active(self.config.get('resize_50', True))
 
                 if 'source_files' in self.config:
                     for file_path in self.config['source_files']:
@@ -1553,13 +1560,14 @@ class MarktplaatsApp(Gtk.Window):
                     if self.config['auto_rotate']:
                         run_safe_command(["mogrify", "-auto-orient", output_path], timeout=60)
 
-                    run_safe_command(["mogrify", "-colorspace", "RGB", "-resize", "50%", "-colorspace", "sRGB", output_path], timeout=120)
+                    if self.config.get('resize_50', True):
+                        run_safe_command(["mogrify", "-colorspace", "RGB", "-resize", "50%", "-colorspace", "sRGB", output_path], timeout=120)
 
                     processed_files.append(output_path)
                     self.update_progress_safe((i + 1) / len(source_files) * 0.5)
 
                 self.transparent_pngs = processed_files
-                self.log_message(f"{len(self.transparent_pngs)} originele afbeeldingen verkleind naar 50%")
+                self.log_message(f"{len(self.transparent_pngs)} originele afbeeldingen verwerkt")
                 self.update_progress_safe(0.6)
 
                 if self.transparent_pngs:
@@ -1586,11 +1594,12 @@ class MarktplaatsApp(Gtk.Window):
                     run_safe_command(["mogrify", "-auto-orient", img], timeout=60)
                     self.update_progress_safe(0.2 + (i / len(copied_files)) * 0.1)
 
-            self.log_message("Stap 3: Verkleinen naar 50%...")
-            for i, img in enumerate(copied_files):
-                if self.stop_flag: return
-                run_safe_command(["mogrify", "-colorspace", "RGB", "-resize", "50%", "-colorspace", "sRGB", img], timeout=120)
-                self.update_progress_safe(0.3 + (i / len(copied_files)) * 0.1)
+            if self.config.get('resize_50', True):
+                self.log_message("Stap 3: Verkleinen naar 50%...")
+                for i, img in enumerate(copied_files):
+                    if self.stop_flag: return
+                    run_safe_command(["mogrify", "-colorspace", "RGB", "-resize", "50%", "-colorspace", "sRGB", img], timeout=120)
+                    self.update_progress_safe(0.3 + (i / len(copied_files)) * 0.1)
 
             if self.config['color_enhance']:
                 self.log_message("Stap 4: Kleurverbetering...")
