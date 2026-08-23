@@ -1879,9 +1879,18 @@ class MarktplaatsApp(Gtk.Window):
         entry.connect("activate", lambda w: dialog.response(Gtk.ResponseType.OK))
         box.pack_start(entry, False, False, 0)
 
+        # Bepaal of het een camera bron is
+        is_camera_source = False
+        source_dir = self.config.get('source_dir', '')
+        if source_dir.startswith('gphoto2://'):
+            is_camera_source = True
+        
         info_text = "Mappen die worden aangemaakt:\n\n"
         info_text += "📁 met_logo/           - JPEG met logo/watermerk (originele achtergrond behouden)\n"
-        info_text += "📁 originelen/         - Originele foto's uit bronmap (optioneel)"
+        if not is_camera_source:
+            info_text += "📁 originelen/         - Originele foto's (worden VERPLAATST uit bronmap)\n"
+        else:
+            info_text += "📁 originelen/         - Originele foto's (worden GEKOPIEERD van camera)\n"
 
         info_label = Gtk.Label()
         info_label.set_markup(f"<small>{info_text}</small>")
@@ -1918,12 +1927,26 @@ class MarktplaatsApp(Gtk.Window):
                     dir_originals = os.path.join(final_dir, "originelen")
                     os.makedirs(dir_originals, exist_ok=True)
                     originals_count = 0
-                    for ext in ['*.jpg', '*.JPG', '*.jpeg', '*.JPEG', '*.png', '*.PNG']:
-                        for img in glob.glob(os.path.join(self.config['source_dir'], ext)):
-                            dest = os.path.join(dir_originals, os.path.basename(img))
-                            shutil.move(img, dest)
-                            originals_count += 1
-                    self.log_message(f"Originelen: {originals_count} bestanden")
+                    
+                    # Gebruik current_source_files voor originele bronbestanden
+                    source_files = self.config.get('current_source_files', [])
+                    
+                    if is_camera_source:
+                        # Camera: kopieer de bestanden
+                        for img in source_files:
+                            if os.path.exists(img):
+                                dest = os.path.join(dir_originals, os.path.basename(img))
+                                shutil.copy2(img, dest)
+                                originals_count += 1
+                        self.log_message(f"Originelen: {originals_count} bestanden GEKOPIEERD van camera")
+                    else:
+                        # Lokale map: verplaats de bestanden
+                        for img in source_files:
+                            if os.path.exists(img):
+                                dest = os.path.join(dir_originals, os.path.basename(img))
+                                shutil.move(img, dest)
+                                originals_count += 1
+                        self.log_message(f"Originelen: {originals_count} bestanden VERPLAATST uit bronmap")
 
                 # Opruimen temp mappen
                 shutil.rmtree(temp_square_dir, ignore_errors=True)
@@ -1983,6 +2006,12 @@ class MarktplaatsApp(Gtk.Window):
 
         bg_type = self.config.get('background_type', 'white')
         tool = self.config.get('bg_removal_tool', 'transparent-background')
+        
+        # Bepaal of het een camera bron is
+        is_camera_source = False
+        source_dir = self.config.get('source_dir', '')
+        if source_dir.startswith('gphoto2://'):
+            is_camera_source = True
 
         info_text = f"Mappen die worden aangemaakt:\n\n"
         info_text += f"📁 transparant/        - Vierkante PNG met transparante achtergrond (2040x2040)\n"
@@ -1997,7 +2026,10 @@ class MarktplaatsApp(Gtk.Window):
             if has_logo_files:
                 info_text += "📁 met_logo_bg/        - JPEG met gekozen achtergrond + watermerk/logo\n"
 
-        info_text += "\n📁 originelen/         - Originele foto's uit bronmap (optioneel)"
+        if not is_camera_source:
+            info_text += "\n📁 originelen/         - Originele foto's (worden VERPLAATST uit bronmap)"
+        else:
+            info_text += "\n📁 originelen/         - Originele foto's (worden GEKOPIEERD van camera)"
 
         info_label = Gtk.Label()
         info_label.set_markup(f"<small>{info_text}</small>")
@@ -2073,12 +2105,26 @@ class MarktplaatsApp(Gtk.Window):
                     dir_originals = os.path.join(final_dir, "originelen")
                     os.makedirs(dir_originals, exist_ok=True)
                     originals_count = 0
-                    for ext in ['*.jpg', '*.JPG', '*.jpeg', '*.JPEG', '*.png', '*.PNG']:
-                        for img in glob.glob(os.path.join(self.config['source_dir'], ext)):
-                            dest = os.path.join(dir_originals, os.path.basename(img))
-                            shutil.move(img, dest)
-                            originals_count += 1
-                    self.log_message(f"Originelen: {originals_count} bestanden")
+                    
+                    # Gebruik current_source_files voor originele bronbestanden
+                    source_files = self.config.get('current_source_files', [])
+                    
+                    if is_camera_source:
+                        # Camera: kopieer de bestanden
+                        for img in source_files:
+                            if os.path.exists(img):
+                                dest = os.path.join(dir_originals, os.path.basename(img))
+                                shutil.copy2(img, dest)
+                                originals_count += 1
+                        self.log_message(f"Originelen: {originals_count} bestanden GEKOPIEERD van camera")
+                    else:
+                        # Lokale map: verplaats de bestanden
+                        for img in source_files:
+                            if os.path.exists(img):
+                                dest = os.path.join(dir_originals, os.path.basename(img))
+                                shutil.move(img, dest)
+                                originals_count += 1
+                        self.log_message(f"Originelen: {originals_count} bestanden VERPLAATST uit bronmap")
 
                 shutil.rmtree(temp_square_dir, ignore_errors=True)
 
@@ -2107,7 +2153,7 @@ class MarktplaatsApp(Gtk.Window):
         dialog.destroy()
         self.start_btn.set_sensitive(True)
         self.stop_btn.set_sensitive(False)
-
+    
     def next_project(self, widget):
         self.log_message("=== START NIEUW PROJECT ===")
         self.transparent_pngs = []
