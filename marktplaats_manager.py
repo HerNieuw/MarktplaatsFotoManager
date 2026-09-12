@@ -1632,6 +1632,38 @@ class MarktplaatsApp(Gtk.Window):
             else:
                 self.transparent_pngs = self.process_remove_background_transparent(images_to_process, transparent_dir)
 
+            # Sommige achtergrond-verwijderingstools (met name transparent-
+            # background, dat op een vaste interne resolutie werkt voor het
+            # AI-model) kunnen de afbeelding intern verkleinen, ONGEACHT
+            # onze eigen 50%-instelling hierboven. Als "verkleinen naar 50%"
+            # uit staat, forceren we hier dus expliciet dat de output exact
+            # dezelfde afmeting krijgt als het bronbestand.
+            if not self.config.get('resize_50', True):
+                bron_afmetingen = {}
+                for img in images_to_process:
+                    try:
+                        with Image.open(img) as bron_img:
+                            bron_afmetingen[os.path.splitext(os.path.basename(img))[0]] = bron_img.size
+                    except Exception:
+                        pass
+
+                for png_path in self.transparent_pngs:
+                    naam = os.path.splitext(os.path.basename(png_path))[0]
+                    doel_afmeting = bron_afmetingen.get(naam)
+                    if not doel_afmeting:
+                        continue
+                    try:
+                        with Image.open(png_path) as huidige_img:
+                            if huidige_img.size != doel_afmeting:
+                                self.log_message(
+                                    f"   ↳ {os.path.basename(png_path)}: tool leverde {huidige_img.size} "
+                                    f"terwijl bron {doel_afmeting} was - terugzetten naar originele afmeting"
+                                )
+                                herschaald = huidige_img.resize(doel_afmeting, Image.Resampling.LANCZOS)
+                                herschaald.save(png_path, 'PNG')
+                    except Exception as e:
+                        self.log_message(f"   ⚠️ Kon afmeting niet corrigeren voor {png_path}: {e}", True)
+
             self.log_message(f"{len(self.transparent_pngs)} transparante PNGs gemaakt")
             self.update_progress_safe(0.6)
 
@@ -1762,7 +1794,7 @@ class MarktplaatsApp(Gtk.Window):
             return
 
         # ===== NORMALE FLOW (Wit, Kleur, Afbeelding) =====
-        self.log_message("Stap 1: Vierkant maken van transparante PNGs (2040x2040)...")
+        self.log_message("Stap 1: Vierkant maken van transparante PNGs...")
         square_pngs = []
 
         for i, png in enumerate(self.transparent_pngs):
@@ -1776,7 +1808,13 @@ class MarktplaatsApp(Gtk.Window):
 
             try:
                 img = Image.open(square_png)
-                square_size = 2040
+                # Canvas-grootte volgt de daadwerkelijke afbeelding (de
+                # langste zijde) i.p.v. een vast 2040px - zo wordt een
+                # grotere foto nooit afgesneden, en een kleinere foto nooit
+                # onnodig "opgeblazen" naar een vaste grootte. Dit was
+                # eerder hardgecodeerd op 2040x2040, los van de 50%-
+                # verkleinen-instelling.
+                square_size = max(img.width, img.height)
                 square_canvas = Image.new('RGBA', (square_size, square_size), (0, 0, 0, 0))
 
                 x_offset = (square_size - img.width) // 2
@@ -2014,7 +2052,7 @@ class MarktplaatsApp(Gtk.Window):
             is_camera_source = True
 
         info_text = f"Mappen die worden aangemaakt:\n\n"
-        info_text += f"📁 transparant/        - Vierkante PNG met transparante achtergrond (2040x2040)\n"
+        info_text += f"📁 transparant/        - Vierkante PNG met transparante achtergrond (afmeting volgt de foto zelf)\n"
         info_text += f"   (gemaakt met: {tool})\n"
         info_text += f"📁 zonder_logo/        - JPEG met witte achtergrond\n"
 
